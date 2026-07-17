@@ -74,6 +74,7 @@ _ASCEND_CUSTOMOP_IS_REIGISTERED = False
 _DEFAULT_BUFFER_SIZE = 200
 _MIN_DP_BUFFER_SIZE = 50
 _DYNAMIC_EPLB_BUFFER_SIZE = 100
+_HCCL_OP_EXPANSION_MODE_CCU_SCHED = 6
 _IS_MOE_MODEL = None
 _IS_DRAFTER_MOE_MODEL = None
 _IS_VL_MODEL = None
@@ -860,7 +861,20 @@ def mlp_tp_enable() -> bool:
     return get_ascend_config().finegrained_tp_config.mlp_tensor_parallel_size > 0
 
 
-def enable_sp(vllm_config=None) -> bool:
+def matmul_allreduce_enable() -> bool:
+    return get_ascend_config().enable_matmul_allreduce
+
+
+def matmul_reduce_scatter_enable() -> bool:
+    return get_ascend_config().enable_matmul_reduce_scatter
+
+
+def enable_sp_by_pass():
+    return get_ascend_config().enable_sp_by_pass
+
+
+def enable_sp(vllm_config=None, enable_shared_expert_dp: bool = False) -> bool:
+    global _ENABLE_SP
     if vllm_config is None:
         try:
             from vllm.config import get_current_vllm_config
@@ -1045,6 +1059,7 @@ def get_hccl_config_for_pg_options(group_name: str) -> dict | None:
     hccl_config_map = {
         "dp": {"hccl_buffer_size": calculate_dp_buffer_size()},
         "dynamic_eplb": {"hccl_buffer_size": _DYNAMIC_EPLB_BUFFER_SIZE},
+        "ccu_sched": {"hccl_op_expansion_mode": _HCCL_OP_EXPANSION_MODE_CCU_SCHED},
     }
     return hccl_config_map.get(group_name, get_default_buffer_config())
 
