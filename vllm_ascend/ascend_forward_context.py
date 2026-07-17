@@ -165,6 +165,30 @@ def set_ascend_forward_context(
         # TODO: remove it when torch_npu.npu_mm_reduce_scatter_base supports tp_size >= 16.
         mmrs_fusion = tp_world_size <= 8
 
+        # set for sequence parallelism, 1000 is the batch size concurrency threshold
+        # for enabling the flashcomm_v1 or sequence_parallelism feature.
+        # Currently, it is an empirical value. In normal scenarios, if the concurrency
+        # exceeds this threshold, the performance benefits can be maximized.
+        # Conversely, if the concurrency is below the threshold,
+        # the performance may degrade due to the switching of communication methods.
+
+        # main model and drafter model may have different architecture
+        is_context_moe_model = is_drafter_moe_model(vllm_config) if is_draft_model else is_moe_model(vllm_config)
+        if is_context_moe_model:
+            flash_comm_v1_enabled = enable_sp(vllm_config) and num_tokens is not None
+            mmrs_fusion = False
+        elif is_draft_model:
+            # TODO: for dense drafter, `sp` is redundant and is not compatible with `dp` and `graph`.
+            # Disable it to avoid more problems.
+            flash_comm_v1_enabled = False
+        else:
+            # Drop the num_tokens>1000 gate: torch.compile traces the SP all_gather
+            # (xTP) ONCE at profile_run (>1000 -> True); both compile ranges inherit
+            # that baked topology, so decode replay at small tokens hits [40] vs [20]
+            # (verified: stock gate crashes in acl_graph replay, src[40,5120] vs
+            # slice[20,5120]). Keeping flash_comm always-on (= enable_sp, like the MoE
+            # branch above) aligns trace with every runtime forward; cudagraph-safe.
+            flash_comm_v1_enabled = enable_sp(vllm_config) and num_tokens is not None
         forward_context.mmrs_fusion = mmrs_fusion
         forward_context.num_tokens = num_tokens
         # set this for rope forward_oot using
