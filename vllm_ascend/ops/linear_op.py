@@ -671,13 +671,13 @@ class SequenceRowParallelOp(CustomRowParallelOp):
             output_dtype = torch.bfloat16
             output, _ = torch_npu.npu_quant_mm_reduce_scatter(
                 quantized_x,
-                self.layer.weight,
+                self.layer.weight.t().contiguous().t(),
                 hcom_name,
                 world_size,
                 reduce_op="sum",
                 bias=None,
                 x1_scale=pertoken_scale,
-                x2_scale=self.layer.weight_scale,
+                x2_scale=self.layer.weight_scale.transpose(0, 1).contiguous(),
                 group_sizes=[1, 1, group_size],
                 x1_scale_dtype=int(FLOAT8_E8M0FNU_DTYPE),
                 x2_scale_dtype=int(FLOAT8_E8M0FNU_DTYPE),
