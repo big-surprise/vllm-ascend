@@ -869,6 +869,10 @@ def matmul_reduce_scatter_enable() -> bool:
     return get_ascend_config().enable_matmul_reduce_scatter
 
 
+def matmul_all_gather_enable() -> bool:
+    return get_ascend_config().enable_matmul_all_gather
+
+
 def enable_sp_by_pass():
     return get_ascend_config().enable_sp_by_pass
 

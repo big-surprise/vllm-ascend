@@ -64,6 +64,7 @@ from vllm_ascend.utils import (
     get_weight_prefetch_method,
     is_vl_model,
     matmul_allreduce_enable,
+    matmul_all_gather_enable,
     matmul_reduce_scatter_enable,
     mlp_tp_enable,
     oproj_tp_enable,
@@ -468,10 +469,24 @@ class SequenceColumnParallelOp(CustomColumnParallelOp):
             and isinstance(getattr(self.quant_method, "quant_method", None), AscendW8A8MXFP8DynamicLinearMethod)
         )
         if prequant_ag:
+            # quant stays OUTSIDE any custom op so norm+quant fuses
+            # (npu_add_rms_norm_dynamic_mx_quant) via fuse_norm_quant pass.
             quantized_x, pertoken_scale = torch_npu.npu_dynamic_mx_quant(input_, dst_type=torch.float8_e4m3fn)
-            quantized_x = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(quantized_x, label=need_all_gather)
-            pertoken_scale = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(pertoken_scale, label=need_all_gather)
-            output_parallel = self.quant_method.apply(self.layer, (quantized_x, pertoken_scale), bias)
+            if matmul_all_gather_enable():
+                # MC2 column fusion: fused all_gather + quant matmul on the
+                # pre-quantized activation (both norm+quant AND AG+matmul fuse).
+                from vllm_ascend.device.mxfp_compat import FLOAT8_E8M0FNU_DTYPE
+
+                group_size = self.quant_method.quant_method.group_size
+                output_parallel = torch.ops.vllm.all_gather_matmul_prequant_mxfp8(
+                    quantized_x, pertoken_scale, self.layer.weight, self.layer.weight_scale,
+                    self.tp_size, group_size, need_all_gather, int(FLOAT8_E8M0FNU_DTYPE),
+                )
+            else:
+                # step-3: pre-AllGather quant (fp8 gather) + plain quant matmul
+                quantized_x = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(quantized_x, label=need_all_gather)
+                pertoken_scale = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(pertoken_scale, label=need_all_gather)
+                output_parallel = self.quant_method.apply(self.layer, (quantized_x, pertoken_scale), bias)
         else:
             input_ = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(input_, label=need_all_gather)
             output_parallel = self.quant_method.apply(self.layer, input_, bias)

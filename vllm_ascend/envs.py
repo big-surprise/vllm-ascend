@@ -70,6 +70,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     # this feature is supported in A2, and eager mode will get better performance.
     "VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE", "0"))),
     "VLLM_ASCEND_ENABLE_MATMUL_REDUCE_SCATTER": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_MATMUL_REDUCE_SCATTER", "0"))),
+    "VLLM_ASCEND_ENABLE_MATMUL_ALL_GATHER": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_MATMUL_ALL_GATHER", "0"))),
     # Whether to enable FlashComm optimization when tensor parallel is enabled.
     # This feature will get better performance when concurrency is large.
     # DEPRECATED: use additional_config.enable_flashcomm1 instead.

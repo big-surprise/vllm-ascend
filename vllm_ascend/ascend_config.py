@@ -616,6 +616,13 @@ class AscendConfig:
                 "only guaranteed when the recompute scheduler is enabled."
             )
 
+        self.enable_matmul_reduce_scatter = self._get_config_value(
+            additional_config,
+            "enable_matmul_reduce_scatter",
+            "VLLM_ASCEND_ENABLE_MATMUL_REDUCE_SCATTER",
+            ascend_envs.VLLM_ASCEND_ENABLE_MATMUL_REDUCE_SCATTER,
+        )
+
         # enable_fused_mc2 enum + MiniMax mutex + multistream auto-disable
         assert self.enable_fused_mc2 in (0, 1), f"enable_fused_mc2 must be 0 or 1, got {self.enable_fused_mc2}"
         model_architectures = getattr(vc.model_config, "architectures", None) or []
