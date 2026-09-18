@@ -3,6 +3,10 @@
 # Purpose: Monkey-patch the Qwen3.5 GDN layer to split in_proj_qkvz into
 #          standalone modules and update the weight loading mapping accordingly,
 #          which is fully equivalent to modifying the vLLM source code directly.
+#
+# Switch: environment variable VLLM_ASCEND_ENABLE_GDN_QKV_SPLIT, defaults to 0 (disabled).
+#         When disabled, this module applies no patch and keeps the upstream fused
+#         in_proj_qkvz layout. Set it to 1 to enable the split.
 
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -12,6 +16,7 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention as _GDNBaseCls,
 )
 
+import vllm_ascend.envs as envs_ascend
 
 _original_gdn_init = _GDNBaseCls.__init__
 
@@ -68,5 +73,6 @@ def _patched_gdn_init(self, *args, **kwargs):
     )
 
 
-_GDNBaseCls.__init__ = _patched_gdn_init
+if envs_ascend.VLLM_ASCEND_ENABLE_GDN_QKV_SPLIT:
+    _GDNBaseCls.__init__ = _patched_gdn_init
 
