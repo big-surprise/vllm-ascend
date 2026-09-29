@@ -28,6 +28,7 @@ from torch._inductor.compile_fx import graph_returns_tuple, make_graph_return_tu
 from torch._inductor.decomposition import select_decomp_table
 from torch.fx import GraphModule
 from vllm.compilation.compiler_interface import CompilerInterface
+from vllm.compilation.passes.inductor_pass import pass_context
 from vllm.config import VllmConfig
 from vllm.config.utils import Range
 from vllm.logger import logger
@@ -84,6 +85,7 @@ def _configure_backend(
     ascend_compilation_config: AscendCompilationConfig,
     vllm_config: VllmConfig,
     process_kwargs_options: Callable | None = None,
+    post_grad_pass: Callable | None = None,
 ) -> None:
     if ascend_compilation_config.enable_static_kernel:
         # npugraph_ex's static_kernel requires LOCAL_WORLD_SIZE to determine the
@@ -119,6 +121,8 @@ def _configure_backend(
             "clone_input": False,
             "clone_output": False,
         }
+        if post_grad_pass is not None:
+            options["post_grad_custom_pre_pass"] = post_grad_pass
         if ascend_compilation_config.enable_static_kernel:
             logger.info_once(
                 "enable_static_kernel is enabled, static shape kernel will be used to accelerate aclgraph execution.",
@@ -135,6 +139,8 @@ def _configure_backend(
         config.debug.run_eagerly = True
         # Disable reinplace pass to avoid gelu fallback to CPU causing host-device copy error.
         config.debug.aclgraph.disable_reinplace_inplaceable_ops_pass = True
+        if post_grad_pass is not None:
+            config.post_grad_custom_pre_pass = post_grad_pass
         if ascend_compilation_config.enable_static_kernel:
             logger.info_once(
                 "enable_static_kernel is enabled, static shape kernel will be used to accelerate aclgraph execution.",
@@ -170,7 +176,11 @@ def npugraph_ex_compile(
         except ImportError:
             from npugraph_ex.configs.npugraphex_config import _process_kwargs_options
         _configure_backend(
-            config, ascend_compilation_config, vllm_config, process_kwargs_options=_process_kwargs_options
+            config,
+            ascend_compilation_config,
+            vllm_config,
+            process_kwargs_options=_process_kwargs_options,
+            post_grad_pass=compiler_config[COMPILATION_PASS_KEY],
         )
         import npugraph_ex.npu_fx_compiler as nfx
 
@@ -213,7 +223,12 @@ def npugraph_ex_compile(
 
         torch.npu.set_compile_mode(jit_compile=False)
         config = torchair.CompilerConfig()
-        _configure_backend(config, ascend_compilation_config, vllm_config)
+        _configure_backend(
+            config,
+            ascend_compilation_config,
+            vllm_config,
+            post_grad_pass=compiler_config[COMPILATION_PASS_KEY],
+        )
         backend = torchair.get_npu_backend(compiler_config=config)
         # torch.compile requires the output of the fx graph to be a tuple
         if not graph_returns_tuple(graph):
@@ -244,6 +259,8 @@ class AscendCompiler(CompilerInterface):
             "torch_npu_version": torch_npu.__version__,
             "enable_npugraph_ex": ascend_compilation_config.enable_npugraph_ex,
             "enable_static_kernel": ascend_compilation_config.enable_static_kernel,
+            "fuse_matmul_allreduce": ascend_compilation_config.fuse_matmul_allreduce,
+            "matmul_allreduce_min_tokens": ascend_compilation_config.matmul_allreduce_min_tokens,
         }
         logger.info("AscendCompiler hash factors: %s", factors)
         return sha256(str(factors).encode(), usedforsecurity=False).hexdigest()[:10]
@@ -280,6 +297,7 @@ class AscendCompiler(CompilerInterface):
             ]
 
         ascend_compilation_config = get_ascend_config().ascend_compilation_config
+        self.compiler_config = compiler_config
         if ascend_compilation_config.enable_npugraph_ex:
             cache_dir = None if getattr(self, "disable_cache", False) else getattr(self, "cache_dir", None)
             logger.info_once(
@@ -332,16 +350,24 @@ class AscendCompiler(CompilerInterface):
                 ]
             ascend_compilation_config = get_ascend_config().ascend_compilation_config
             assert hasattr(self, "vllm_config")
-            compiled_fn, _ = npugraph_ex_compile(
-                graph,
-                example_inputs,
-                {},
-                self.vllm_config,
-                ascend_compilation_config,
-                compile_range,
-                key,
-                getattr(self, "cache_dir", None),
-            )
+            compiler_config = getattr(self, "compiler_config", None)
+            if compiler_config is None:
+                from vllm_ascend.compilation.graph_fusion_pass_manager import GraphFusionPassManager
+
+                pass_manager = GraphFusionPassManager()
+                pass_manager.configure(self.vllm_config)
+                compiler_config = {COMPILATION_PASS_KEY: pass_manager}
+            with pass_context(compile_range):
+                compiled_fn, _ = npugraph_ex_compile(
+                    graph,
+                    example_inputs,
+                    compiler_config,
+                    self.vllm_config,
+                    ascend_compilation_config,
+                    compile_range,
+                    key,
+                    getattr(self, "cache_dir", None),
+                )
             return compiled_fn
 
         from npugraph_ex.npu_fx_compiler import _CompiledFxArtifacts, _CompiledFxGraph

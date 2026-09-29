@@ -70,11 +70,23 @@ class AscendCompilationConfig:
     fuse_norm_quant: bool = True
     fuse_qknorm_rope: bool = True
     fuse_muls_add: bool = True
+    # Fuse RowParallelLinear's GEMM with its TP all-reduce via
+    # aclnnMatmulAllReduce. Off by default because the crossover point is
+    # workload- and hardware-dependent.
+    fuse_matmul_allreduce: bool = False
+    # Minimum token count at which matmul-allreduce fusion is applied. When
+    # enabled, the preceding value is added as a compile-range split point.
+    matmul_allreduce_min_tokens: int = 512
 
     @model_validator(mode="after")
     def _apply_unsupported_hardware_downgrade_and_static_kernel_check(self):
         from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 
+        if self.matmul_allreduce_min_tokens <= 0:
+            raise ValueError(
+                "matmul_allreduce_min_tokens must be a positive integer; "
+                f"got {self.matmul_allreduce_min_tokens}"
+            )
         if not get_current_hardware_profile().supports(HardwareCapability.NPUGRAPH_EX):
             if self.enable_npugraph_ex:
                 logger.warning("npugraph_ex is not supported by the current hardware profile. Disabling it.")
@@ -277,7 +289,9 @@ class AscendConfig:
                 "enable_static_kernel": false,
                 "fuse_norm_quant": true,
                 "fuse_qknorm_rope": true,
-                "fuse_muls_add": true
+                "fuse_muls_add": true,
+                "fuse_matmul_allreduce": false,
+                "matmul_allreduce_min_tokens": 512
             },
             "ascend_fusion_config": {
                 "fusion_ops_gmmswigluquant": true
@@ -479,6 +493,14 @@ class AscendConfig:
     # the max_num_batched_tokens that sequence-parallel writeback corrected).
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
+        if self.ascend_compilation_config.fuse_matmul_allreduce:
+            split_point = self.ascend_compilation_config.matmul_allreduce_min_tokens - 1
+            if split_point > 0:
+                compile_ranges = self._get_compile_ranges(vc.compilation_config)
+                self._set_compile_ranges(
+                    vc.compilation_config,
+                    sorted(set(compile_ranges) | {split_point}),
+                )
         self._check_mooncake_c8_kv_cache_quant(vc)
 
         # profiling_chunk vs min_chunk clamp

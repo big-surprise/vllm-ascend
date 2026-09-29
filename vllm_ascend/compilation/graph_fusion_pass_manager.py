@@ -33,7 +33,7 @@ class GraphFusionPassManager:
     def __init__(self):
         self.passes: list[VllmInductorPass] = []
 
-    def __call__(self, graph: fx.Graph) -> fx.Graph:
+    def __call__(self, graph: fx.Graph, *_args, **_kwargs) -> fx.Graph:
         compile_range = get_pass_context().compile_range
 
         for pass_ in self.passes:
@@ -67,3 +67,8 @@ class GraphFusionPassManager:
             from .passes.muls_add_pass import MulsAddFusionPass
 
             self.passes.append(MulsAddFusionPass(config))
+
+        if self.ascend_compilation_config.fuse_matmul_allreduce and not is_310p():
+            from .passes.matmul_allreduce_fusion_pass import MatmulAllReduceFusionPass
+
+            self.passes.append(MatmulAllReduceFusionPass(config))
