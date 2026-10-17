@@ -315,6 +315,40 @@ class BaseDeviceAdaptor:
         )
 
     @staticmethod
+    def npu_mm_all_reduce_base(
+        x1: torch.Tensor,
+        x2: torch.Tensor,
+        hcom: str,
+        *,
+        reduce_op: str = "sum",
+        bias: torch.Tensor | None = None,
+        x1_scale: torch.Tensor | None = None,
+        x2_scale: torch.Tensor | None = None,
+        comm_turn: int = 0,
+        output_dtype: torch.dtype | None = None,
+        comm_mode: str | None = None,
+    ):
+        # comm_mode stays unset by default: CANN's own choice measured faster
+        # than an explicit "ccu" at every M for the matmul + all-reduce fusion.
+        # Unset optional kwargs are dropped rather than forwarded as None so
+        # that older torch-npu builds without them still work.
+        optional = {
+            "bias": bias,
+            "x1_scale": x1_scale,
+            "x2_scale": x2_scale,
+            "output_dtype": output_dtype,
+            "comm_mode": comm_mode,
+        }
+        return torch_npu.npu_mm_all_reduce_base(
+            x1,
+            x2,
+            hcom,
+            reduce_op=reduce_op,
+            comm_turn=comm_turn,
+            **{key: value for key, value in optional.items() if value is not None},
+        )
+
+    @staticmethod
     def npu_dynamic_quant(
         hidden_states: torch.Tensor,
         dynamic_scale: torch.Tensor | None = None,
@@ -1273,6 +1307,44 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
             x2_scale=x2_scale,
             output_dtype=output_dtype,
             comm_mode=comm_mode,
+        )
+
+    @staticmethod
+    def npu_mm_all_reduce_base(
+        x1: torch.Tensor,
+        x2: torch.Tensor,
+        hcom: str,
+        *,
+        reduce_op: str = "sum",
+        bias: torch.Tensor | None = None,
+        x1_scale: torch.Tensor | None = None,
+        x2_scale: torch.Tensor | None = None,
+        comm_turn: int = 0,
+        output_dtype: torch.dtype | None = None,
+        comm_mode: str | None = None,
+    ):
+        # A5 runs matmul-all-reduce on the AICPU MC2 path. Unlike the
+        # reduce-scatter variant this does not default to "ai_cpu": the
+        # measured best on Ascend950PR was CANN's own choice, so only an
+        # explicit operator opt-in (HCCL_OP_EXPANSION_MODE=CCU_SCHED) switches
+        # the mode.
+        if comm_mode is None and os.environ.get("HCCL_OP_EXPANSION_MODE") == "CCU_SCHED":
+            comm_mode = "ccu"
+
+        optional = {
+            "bias": bias,
+            "x1_scale": x1_scale,
+            "x2_scale": x2_scale,
+            "output_dtype": output_dtype,
+            "comm_mode": comm_mode,
+        }
+        return torch_npu.npu_mm_all_reduce_base(
+            x1,
+            x2,
+            hcom,
+            reduce_op=reduce_op,
+            comm_turn=comm_turn,
+            **{key: value for key, value in optional.items() if value is not None},
         )
 
     @staticmethod

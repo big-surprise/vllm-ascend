@@ -352,6 +352,8 @@ class TestAscendConfig(TestBase):
 
         ascend_compilation_config = ascend_config.ascend_compilation_config
         self.assertTrue(ascend_compilation_config.fuse_norm_quant)
+        self.assertFalse(ascend_compilation_config.fuse_matmul_allreduce)
+        self.assertEqual(ascend_compilation_config.matmul_allreduce_min_tokens, 1024)
 
         ascend_fusion_config = ascend_config.ascend_fusion_config
         self.assertTrue(ascend_fusion_config.fusion_ops_gmmswigluquant)
@@ -446,6 +448,8 @@ class TestAscendConfig(TestBase):
         test_vllm_config.additional_config = {
             "ascend_compilation_config": {
                 "fuse_norm_quant": False,
+                "fuse_matmul_allreduce": True,
+                "matmul_allreduce_min_tokens": 768,
             },
             "ascend_fusion_config": {
                 "fusion_ops_gmmswigluquant": False,
@@ -467,6 +471,9 @@ class TestAscendConfig(TestBase):
 
         ascend_compilation_config = ascend_config.ascend_compilation_config
         self.assertFalse(ascend_compilation_config.fuse_norm_quant)
+        self.assertTrue(ascend_compilation_config.fuse_matmul_allreduce)
+        self.assertEqual(ascend_compilation_config.matmul_allreduce_min_tokens, 768)
+        self.assertIn(767, test_vllm_config.compilation_config.compile_ranges_endpoints)
         self.assertFalse(ascend_config.enable_kv_nz)
         self.assertTrue(ascend_compilation_config.enable_npugraph_ex)
         self.assertFalse(ascend_compilation_config.enable_static_kernel)
@@ -1186,6 +1193,13 @@ class TestSubconfigPydanticTypeValidation(TestBase):
         self.assertFalse(cfg.enable_npugraph_ex)
         with self.assertRaises(ValueError):
             AscendCompilationConfig(unknown_key=1)
+
+    def test_matmul_allreduce_min_tokens_must_be_positive(self):
+        for value in (0, -1):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValueError, "matmul_allreduce_min_tokens must be a positive integer"
+            ):
+                AscendCompilationConfig(matmul_allreduce_min_tokens=value)
 
     def test_profiling_chunk_config_int_lax_and_range(self):
         # int string "2" coerces to 2 (fixes "2"==2 silent failure)
