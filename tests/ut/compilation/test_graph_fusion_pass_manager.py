@@ -66,3 +66,25 @@ class TestGraphFusionPassManagerConfig(TestBase):
             manager.configure(vllm_config)
 
         self.assertEqual(len(manager.passes), 1)
+
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_fuse_matmul_allreduce_registers_pass(self, mock_platform):
+        vllm_config = VllmConfig()
+        vllm_config.model_config = MagicMock(dtype=torch.bfloat16)
+        vllm_config.additional_config = {
+            "ascend_compilation_config": {
+                "fuse_norm_quant": "false",
+                "fuse_qknorm_rope": "false",
+                "fuse_muls_add": "false",
+                "fuse_matmul_allreduce": True,
+            }
+        }
+        init_ascend_config(vllm_config)
+
+        with patch(
+            "vllm_ascend.compilation.passes.matmul_allreduce_fusion_pass.MatmulAllReduceFusionPass"
+        ) as pass_cls:
+            manager = GraphFusionPassManager()
+            manager.configure(vllm_config)
+
+        self.assertEqual(manager.passes, [pass_cls.return_value])

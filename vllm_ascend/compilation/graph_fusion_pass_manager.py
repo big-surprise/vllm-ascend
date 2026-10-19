@@ -35,7 +35,7 @@ class GraphFusionPassManager:
     def __init__(self):
         self.passes: list[VllmInductorPass] = []
 
-    def __call__(self, graph: fx.Graph) -> fx.Graph:
+    def __call__(self, graph: fx.Graph, *_args, **_kwargs) -> fx.Graph:
         compile_range = get_pass_context().compile_range
 
         for pass_ in self.passes:
@@ -78,3 +78,11 @@ class GraphFusionPassManager:
             from .passes.mm_reduce_scatter_fusion_pass import MatmulReduceScatterFusionPass
 
             self.passes.append(MatmulReduceScatterFusionPass(config))
+
+        # The hardware gate lives inside the pass: it stands down on FORCE_NZ
+        # weight layouts (310P), on non-fp16/bf16 dtypes and on TP=1, so no
+        # `is_310p()` check is needed here.
+        if self.ascend_compilation_config.fuse_matmul_allreduce:
+            from .passes.matmul_allreduce_fusion_pass import MatmulAllReduceFusionPass
+
+            self.passes.append(MatmulAllReduceFusionPass(config))

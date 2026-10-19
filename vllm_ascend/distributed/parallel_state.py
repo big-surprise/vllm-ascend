@@ -5,11 +5,14 @@ from vllm.config import ParallelConfig, get_current_vllm_config
 from vllm.distributed import parallel_state as vllm_parallel_state
 from vllm.distributed.parallel_state import (
     GroupCoordinator,
+    get_tp_group,
     get_world_group,
     init_model_parallel_group,
 )
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.device.device_config import get_ascend_device_type
+from vllm_ascend.device.hardware import AscendDeviceType
 
 if TYPE_CHECKING:
     from vllm.config import EngramConfig
@@ -57,6 +60,10 @@ class ReplicatedGroup:
 
 # Singleton: identical on every rank, no HCCL comm created.
 _REPLICATED = ReplicatedGroup()
+
+# aclnnMatmulAllReduce (AICPU MC2) needs a dedicated TP-layout domain. It must
+# not reuse _MC2, which is EP-like laid out, nor the plain TP group.
+_MATMUL_ALLREDUCE: GroupCoordinator | None = None
 
 
 def init_ascend_model_parallel(
@@ -164,6 +171,29 @@ def init_ascend_model_parallel(
     global _MC2
     _MC2 = init_model_parallel_group(group_ranks, get_world_group().local_rank, backend, group_name="mc2")
 
+    if (
+        get_ascend_device_type() == AscendDeviceType.A5
+        and global_tp_size > 1
+        and get_ascend_config().ascend_compilation_config.fuse_matmul_allreduce
+    ):
+        global _MATMUL_ALLREDUCE
+        # Initialize ordinary HCCL resources before AICPU MC2. Even separate
+        # domains can fail with 507018 if MC2 initializes process resources
+        # first.
+        warmup = torch.zeros(1, device=get_tp_group().device)
+        torch.distributed.all_reduce(warmup, group=get_tp_group().device_group)
+        torch.npu.synchronize()
+        # The mc2 name preserves HCCL_BUFFSIZE instead of applying the small
+        # ordinary-collective buffer override. Never share this domain with
+        # decode AllReduce: AICPU MC2 initialization affects communicator
+        # state.
+        _MATMUL_ALLREDUCE = init_model_parallel_group(
+            [x.tolist() for x in all_ranks.view(-1, global_tp_size)],
+            get_world_group().local_rank,
+            backend,
+            group_name="matmul_allreduce_mc2",
+        )
+
     if get_ascend_config().eplb_config.dynamic_eplb:
         global _DYNAMIC_EPLB
         _DYNAMIC_EPLB = init_model_parallel_group(
@@ -221,6 +251,11 @@ def get_mc2_group() -> GroupCoordinator:
     return _MC2
 
 
+def get_matmul_allreduce_group() -> GroupCoordinator:
+    assert _MATMUL_ALLREDUCE is not None, "MatmulAllReduce group is not initialized"
+    return _MATMUL_ALLREDUCE
+
+
 def get_mlp_tp_group() -> GroupCoordinator:
     assert _MLP_TP is not None, "mlp group is not initialized"
     return _MLP_TP
@@ -270,6 +305,11 @@ def destroy_ascend_model_parallel():
     if _MC2:
         _MC2.destroy()
     _MC2 = None
+
+    global _MATMUL_ALLREDUCE
+    if _MATMUL_ALLREDUCE:
+        _MATMUL_ALLREDUCE.destroy()
+    _MATMUL_ALLREDUCE = None
 
     global _MLP_TP
     if _MLP_TP:
