@@ -42,6 +42,7 @@ from vllm.v1.attention.ops.pcp import _gather_prefill_cache_inputs  # type: igno
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import AttentionSpec, CrossAttentionSpec
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.context_parallel.common_cp import (
@@ -71,6 +72,15 @@ SWA_INT_MAX = 2147483647
 _FIA_WORKSPACE_KEY = "npu_fused_infer_attention_score.workspace"
 _FIA_V2_WORKSPACE_KEY = "npu_fused_infer_attention_score_v2.workspace"
 _PA_WORKSPACE_KEY = "npu_paged_attention.workspace"
+
+# FIA sparse modes used by this backend:
+#   0 = defaultMask (non-causal), 2 = leftUpCausal,
+#   3 = rightDownCausal, 4 = band (sliding window)
+# NOTE: aclnnFusedInferAttentionScore rejects an empty `atten_mask` for every
+# sparse mode other than 0 --
+#   "when sparse_mode is 3 (not 0), atten_mask cannot be empty" (EZ0026)
+# so `atten_mask` must always be forwarded, even though the operator builds the
+# mask itself for modes 2/3/4 and never reads the buffer contents.
 
 
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
@@ -647,6 +657,29 @@ class AscendAttentionBackendImpl(AttentionImpl):
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         super().process_weights_after_loading(act_dtype)
 
+    def _resolve_fia_sparse_mode(self, causal: bool, is_prefill_only: bool = False) -> int:
+        """Pick the FIA sparse mode for an attention call.
+
+        Sparse mode 2 (leftUpCausal) and 3 (rightDownCausal) are identical
+        whenever q_len == kv_len, i.e. on a prefill-only batch, so only that
+        case may opt into the override. Anything else (decode, or prefill mixed
+        with decode) keeps rightDownCausal, because there q_len < kv_len and
+        leftUpCausal would silently drop the KV history.
+
+        `is_prefill_only` must therefore be True only when the call is
+        guaranteed to hold no decode request. This matters for graph capture:
+        FIAParamProvider replays a graph with only the sequence lengths and
+        block table updated, so the sparse mode decided here is baked into the
+        captured graph.
+        """
+        if self.sliding_window is not None:
+            return 4
+        if not causal:
+            return 0
+        if not is_prefill_only:
+            return 3
+        return envs.VLLM_ASCEND_FIA_PREFILL_SPARSE_MODE
+
     def full_graph_fia(
         self,
         query: torch.Tensor,
@@ -662,8 +695,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
         actual_seq_lengths_q = attn_metadata.actual_seq_lengths_q
         softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)
         input_layout = "TND"
+        is_prefill_only = attn_metadata.num_decodes == 0 and attn_metadata.num_prefills > 0
+        sparse_mode = self._resolve_fia_sparse_mode(attn_metadata.causal, is_prefill_only=is_prefill_only)
         attn_mask = attn_metadata.attn_mask
-        sparse_mode = 4 if self.sliding_window else 3 if attn_metadata.causal else 0
         pre_tokens = self.sliding_window or SWA_INT_MAX
         next_tokens = 0 if self.sliding_window else SWA_INT_MAX
         output_view = output[: attn_metadata.num_actual_tokens]
@@ -766,6 +800,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
             key = key.contiguous()
             value = value.contiguous()
 
+        is_prefill_only = attn_metadata.num_decodes == 0 and attn_metadata.num_prefills > 0
+        sparse_mode = self._resolve_fia_sparse_mode(True, is_prefill_only=is_prefill_only)
+        attn_mask = attn_metadata.attn_mask
+
         use_max_workspace = self._use_max_workspace_for_fia_graph
         workspace = get_capture_resource(
             _FIA_V2_WORKSPACE_KEY,
@@ -773,7 +811,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 query=query,
                 key=key,
                 value=value,
-                atten_mask=attn_metadata.attn_mask,
+                atten_mask=attn_mask,
                 block_table=block_table,
                 input_layout="TND",
                 block_size=block_size,
@@ -782,7 +820,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 num_key_value_heads=self.num_kv_heads,
                 softmax_scale=self.scale,
                 num_query_heads=self.num_heads,
-                sparse_mode=4 if self.sliding_window is not None else 3,
+                sparse_mode=sparse_mode,
                 pre_tokens=self.sliding_window if self.sliding_window is not None else SWA_INT_MAX,
                 next_tokens=0,
                 learnable_sink=self.sinks,
@@ -795,7 +833,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 "query": query,
                 "key": key,
                 "value": value,
-                "atten_mask": attn_metadata.attn_mask,
+                "atten_mask": attn_mask,
                 "block_table": block_table,
                 "input_layout": "TND",
                 "block_size": block_size,
@@ -803,7 +841,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 "actual_seq_kvlen": actual_seq_lengths_kv,
                 "num_key_value_heads": self.num_kv_heads,
                 "num_query_heads": self.num_heads,
-                "sparse_mode": 4 if self.sliding_window is not None else 3,
+                "sparse_mode": sparse_mode,
                 "pre_tokens": self.sliding_window if self.sliding_window is not None else SWA_INT_MAX,
                 "next_tokens": 0,
                 "softmax_scale": self.scale,
@@ -947,10 +985,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
             actual_seq_qlen = attn_metadata.actual_seq_lengths_q
             if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
                 actual_seq_qlen = torch.tensor([1] * len(attn_metadata.seq_lens_list), dtype=torch.int32).cumsum(dim=0)
-            if self.sliding_window is not None:
-                sparse_mode = 4
-            else:
-                sparse_mode = 3
+            sparse_mode = self._resolve_fia_sparse_mode(
+                True, is_prefill_only=attn_metadata.attn_state == AscendAttentionState.PrefillNoCache
+            )
             attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
                 query,
                 key.contiguous(),
@@ -1106,6 +1143,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
             prefill_seq_qlen = [
                 actual_seq_qlen[i] - num_decode_tokens for i in range(num_decodes, len(actual_seq_qlen))
             ]
+            # q_len == kv_len on the prefill slice, so leftUpCausal (2) is
+            # equivalent to rightDownCausal (3) here and may tile differently.
+            prefill_sparse_mode = self._resolve_fia_sparse_mode(True, is_prefill_only=True)
             prefill_out, _ = DeviceOperator.npu_fused_infer_attention_score(
                 query=query[num_decode_tokens:num_tokens],
                 key=key,
@@ -1126,7 +1166,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 current_value=value,
                 attn_metadata=attn_metadata,
                 is_prefill_no_cache=False,
-                sparse_mode=3,
+                sparse_mode=prefill_sparse_mode,
             )
             n_prefill = num_tokens - num_decode_tokens
             output[num_decode_tokens:num_tokens] = prefill_out.view(n_prefill, self.num_heads, self.head_size)

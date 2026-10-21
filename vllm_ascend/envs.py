@@ -35,6 +35,13 @@ def _strict_binary_env(name: str, default: str = "0") -> bool:
     return value == "1"
 
 
+def _strict_choice_env(name: str, choices: set[str], default: str) -> int:
+    value = os.getenv(name, default)
+    if value not in choices:
+        raise ValueError(f"{name} must be one of {sorted(choices)}, got {value!r}")
+    return int(value)
+
+
 env_variables: dict[str, Callable[[], Any]] = {
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
@@ -87,6 +94,17 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (safe for Ascend 910B/A3). Set to a positive value to override when
     # auto-detection is unavailable or for debugging UB overflow issues.
     "VLLM_ASCEND_ROPE_UB_SIZE_KB": lambda: int(os.getenv("VLLM_ASCEND_ROPE_UB_SIZE_KB") or 0),
+    # FIA sparse mode for the causal prefill-only path. leftUpCausal (2) and
+    # rightDownCausal (3) are mathematically identical whenever q_len == kv_len,
+    # but the operator may pick a different tiling for each. Default 3 keeps
+    # today's behaviour; set to 2 to A/B test the prefill tiling. The override
+    # only ever applies to batches that hold no decode request -- decode and
+    # mixed batches stay on 3, because there q_len < kv_len and leftUpCausal
+    # would silently drop the KV history. Valid values: 2 or 3.
+    # This configuration is not sensitive.
+    "VLLM_ASCEND_FIA_PREFILL_SPARSE_MODE": lambda: _strict_choice_env(
+        "VLLM_ASCEND_FIA_PREFILL_SPARSE_MODE", {"2", "3"}, "3"
+    ),
 }
 
 # end-env-vars-definition
