@@ -83,6 +83,27 @@ class UpdatableGraph(torch.npu.NPUGraph):
         self.provider_sizes: dict[ParamProvider, int] = {}
         self.capture_resources: dict[Hashable, Any] = {}
         self.capture_token: Token[UpdatableGraph | None] | None = None
+        # Recorded on the replay stream after every replay; the update stream
+        # waits on it before mutating task descriptors for the next iteration.
+        # This keeps the replay -> update ordering on device instead of
+        # blocking the host with a stream synchronize before each replay.
+        self.replay_end_event: torch.npu.Event | None = None
+
+    def record_replay_end(self) -> None:
+        """Mark the end of the latest replay on the current stream."""
+        if self.replay_end_event is None:
+            self.replay_end_event = torch.npu.Event()
+        self.replay_end_event.record()
+
+    def wait_replay_end(self, update_stream) -> None:
+        """Order update_stream after the previous replay of this graph.
+
+        Stream waits snapshot the event's last record at call time, so
+        re-recording the event after the next replay does not affect the
+        wait enqueued here.
+        """
+        if self.replay_end_event is not None:
+            update_stream.wait_event(self.replay_end_event)
 
     def capture_begin(self, pool=None, capture_error_mode: str = "global") -> None:
         super().capture_begin(pool=pool, capture_error_mode=capture_error_mode)

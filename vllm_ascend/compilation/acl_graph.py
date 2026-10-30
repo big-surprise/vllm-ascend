@@ -290,11 +290,16 @@ class ACLGraphWrapper:
         # we do not need to synchronize.
         # When enable_enpu is on, model_runner orders update vs replay; skip here.
         # When FULL + EAGLE draft (merge path), replay does not need this barrier.
+        # The UpdatableGraph path enforces the same ordering on device
+        # (see _updatable_graph_replay), so it must not pay this host-side
+        # barrier: blocking the CPU here every decode step stalls input
+        # preparation for the next step and bubbles the NPU.
         is_draft_eagle = _EXTRA_CTX.is_draft_model and self.use_eagle
-        need_sync = self.runtime_mode == CUDAGraphMode.FULL and not is_draft_eagle
+        updatable_replay = self.runtime_mode == CUDAGraphMode.FULL and use_updatable_graph(self.attn_backend)
+        need_sync = self.runtime_mode == CUDAGraphMode.FULL and not is_draft_eagle and not updatable_replay
         if not self.enable_enpu and need_sync:
             torch.npu.current_stream().synchronize()
-        if self.runtime_mode == CUDAGraphMode.FULL and use_updatable_graph(self.attn_backend):
+        if updatable_replay:
             self._updatable_graph_replay(forward_context, entry.aclgraph)
         else:
             entry.aclgraph.replay()
@@ -315,7 +320,16 @@ class ACLGraphWrapper:
             graph.update(self.update_stream, resolved_tasks)
             graph.replay()
         else:
+            # Order this iteration's task updates after the PREVIOUS replay
+            # of this graph entirely on device: replay(i-1) -> update(i).
+            # Without it, update(i) could overwrite task descriptors while
+            # in-flight replay(i-1) kernels still read them. The update
+            # stream waits on an event recorded at the end of the last
+            # replay, replacing the host-side stream synchronize that used
+            # to gate this path, so the CPU stays ahead of the device.
+            graph.wait_replay_end(self.update_stream)
             graph.replay()
+            graph.record_replay_end()
             graph.update(self.update_stream, resolved_tasks)
 
 
