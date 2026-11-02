@@ -12,7 +12,6 @@ import torch
 import torch_npu
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.utils.torch_utils import direct_register_custom_op
-
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.weight_prefetch import MAX_PREFETCH_WEIGHT_SIZE, layer_idx_from_prefix, layers_of_model_instance
 from vllm_ascend.utils import enable_custom_op, get_weight_prefetch_method, npu_stream_switch, prefetch_stream
@@ -23,10 +22,21 @@ MLP_PREFETCH_TOKEN_THRESHOLD = 500
 ALLREDUCE_NORM_FUSE_THRESHOLD = 512
 
 
-def _attention_gate_up_target(prefix):
-    """Resolve only the current decoder's unfused Attention output reduction."""
+def _uses_all_reduce_prefetch(projection):
+    """Only suppress the Norm fallback for projections with a real issue site."""
+    from vllm_ascend.ops.linear import AscendRowParallelLinear
     from vllm_ascend.ops.linear_op import MatmulAllreduceRowParallelOp
 
+    if not getattr(projection, "reduce_results", False) or getattr(projection, "tp_size", 0) <= 1:
+        return False
+    op = getattr(projection, "custom_op", None)
+    if isinstance(op, MatmulAllreduceRowParallelOp):
+        return True
+    return op is None and isinstance(projection, AscendRowParallelLinear) and projection.input_is_parallel
+
+
+def _attention_gate_up_target(prefix):
+    """Resolve only the current decoder's unfused Attention output reduction."""
     method = get_weight_prefetch_method()
     if method is None or not method.use_qwen_dense_mlp_prefetch:
         return None
@@ -47,12 +57,9 @@ def _attention_gate_up_target(prefix):
         if prefix.endswith(".self_attn.o_proj")
         else getattr(attention, "out_proj", None)
     )
-    op = getattr(projection, "custom_op", None)
     if (
-        not isinstance(op, MatmulAllreduceRowParallelOp)
+        not _uses_all_reduce_prefetch(projection)
         or projection.prefix != prefix
-        or not op.reduce_results
-        or op.tp_size <= 1
         or not hasattr(layer.mlp, "gate_up_proj")
     ):
         return None
@@ -68,8 +75,6 @@ def _next_layer_input_proj_target(prefix):
     uses at o_proj, so reuse it. Measured at TP4: 22.48us idle window against
     a 17.25us MTE2 for in_proj_qkvz (40MiB).
     """
-    from vllm_ascend.ops.linear_op import MatmulAllreduceRowParallelOp
-
     method = get_weight_prefetch_method()
     if method is None or not method.is_qwen_dense:
         return None
@@ -82,41 +87,6 @@ def _next_layer_input_proj_target(prefix):
     # Qwen3.5 alternates linear_attention and full_attention layers.
     nxt = layers[idx + 1]
     attention = getattr(nxt, "linear_attn", None) or getattr(nxt, "self_attn", None)
-    projection = getattr(attention, "in_proj_qkvz", None) or getattr(attention, "qkv_proj", None)
-    weight = getattr(projection, "weight", None)
-    if weight is None:
-        return None
-    # If this down_proj does not route through matmul_and_reduce the fork never
-    # runs, so report no target rather than silently doing nothing.
-    down = getattr(getattr(layers[idx], "mlp", None), "down_proj", None)
-    if not isinstance(getattr(down, "custom_op", None), MatmulAllreduceRowParallelOp):
-        return None
-    return weight, float(method.attn.prefetch_ratio.get("qkv", 0))
-
-
-def next_layer_qkv_prefetch_target(layer):
-    """Layer N+1's input projection weight, resolved from layer N's decoder.
-
-    Same target as _next_layer_input_proj_target(), reached from the dense MLP
-    instead of a MatmulAllreduceRowParallelOp that this tree never builds.
-    Qwen3.5 alternates linear_attention and full_attention layers, so accept
-    in_proj_qkvz or qkv_proj.
-    """
-    method = get_weight_prefetch_method()
-    if method is None or not method.is_qwen_dense or not method.attn.enable:
-        return None
-    ratio = float(method.attn.prefetch_ratio.get("qkv", 0))
-    if ratio <= 0:
-        return None
-    down = getattr(getattr(layer, "mlp", None), "down_proj", None)
-    idx = layer_idx_from_prefix(getattr(down, "prefix", ""))
-    layers = layers_of_model_instance(_EXTRA_CTX.model_instance)
-    if layers is None or idx is None or not 0 <= idx + 1 < len(layers):
-        return None
-    nxt = layers[idx + 1]
-    attention = getattr(nxt, "linear_attn", None) or getattr(nxt, "self_attn", None)
-    # This branch splits in_proj_qkvz into in_proj_qkv + in_proj_z; prefer the
-    # split projection, then the fused one, then full attention's qkv_proj.
     projection = (
         getattr(attention, "in_proj_qkv", None)
         or getattr(attention, "in_proj_qkvz", None)
@@ -125,8 +95,12 @@ def next_layer_qkv_prefetch_target(layer):
     weight = getattr(projection, "weight", None)
     if weight is None:
         return None
-    size = _prefetch_size(weight, ratio)
-    return (weight, size) if size > 0 else None
+    # The ordinary row-parallel and matmul_and_reduce paths both issue at
+    # this boundary. Do not add another prefetch around mlp.down_proj.
+    down = getattr(getattr(layers[idx], "mlp", None), "down_proj", None)
+    if not _uses_all_reduce_prefetch(down):
+        return None
+    return weight, float(method.attn.prefetch_ratio.get("qkv", 0))
 
 
 def _all_reduce_prefetch_target(prefix):
@@ -140,39 +114,54 @@ def _all_reduce_prefetch_target(prefix):
 
 
 def attention_all_reduce_with_prefetch(output, prefix):
-    # Called after MatMul. Down-projection submits AllReduce before prefetch;
-    # attention projections retain prefetch-first ordering.
+    # MatmulAllreduceRowParallelOp already calls this inside a custom op.
     target = _all_reduce_prefetch_target(prefix)
-    if target is not None and prefix.endswith(".mlp.down_proj"):
-        weight, ratio = target
-        size = min(int(weight.numel() * weight.element_size() * ratio), MAX_PREFETCH_WEIGHT_SIZE)
-        if size > 0 and 0 < output.shape[0] < MLP_PREFETCH_TOKEN_THRESHOLD:
-            compute = torch_npu.npu.current_stream()
-            stream = prefetch_stream()
-            # Snapshot the Down MatMul boundary BEFORE submitting AllReduce.
-            # This wait must not include the subsequent collective.
-            stream.wait_stream(compute)
-            output = tensor_model_parallel_all_reduce(output)
-            with npu_stream_switch(stream):
-                # The stream wait supplies readiness. Do not depend on the
-                # reduction tensor, which the collective may update in place.
-                torch_npu.npu_prefetch(weight, None, size, 0)
-            _finish_prefetch(stream)
-            return output
+    if target is None:
         return tensor_model_parallel_all_reduce(output)
-    stream = _start_prefetch(target[0], output, target[1]) if target is not None else None
-    output = tensor_model_parallel_all_reduce(output)
+    return all_reduce_with_weight_prefetch(output, target[0], target[1], prefix.endswith(".mlp.down_proj"))
+
+
+def all_reduce_with_weight_prefetch(
+    output: torch.Tensor, weight: torch.Tensor, ratio: float, reduce_first: bool
+) -> torch.Tensor:
+    """Keep the token gate and stream operations opaque to torch.compile.
+
+    profile_run may trace with a prefill shape. The ordinary RowParallel
+    path must call this through torch.ops so a later decode capture still
+    evaluates the gate with its actual shape. Returning the reduction puts
+    the op on the real data path; no unused side-effect-only node is needed.
+    """
+    size = _prefetch_size(weight, ratio)
+    if size <= 0 or not 0 < output.shape[0] < MLP_PREFETCH_TOKEN_THRESHOLD:
+        return tensor_model_parallel_all_reduce(output)
+
+    if reduce_first:
+        compute = torch_npu.npu.current_stream()
+        stream = prefetch_stream()
+        # Snapshot the MatMul boundary before submitting the collective.
+        # Prefetch must not wait for, or depend on, its in-place updates.
+        stream.wait_stream(compute)
+        output = tensor_model_parallel_all_reduce(output)
+        with npu_stream_switch(stream):
+            torch_npu.npu_prefetch(weight, None, size, 0)
+    else:
+        stream = _start_prefetch(weight, output, ratio)
+        output = tensor_model_parallel_all_reduce(output)
     _finish_prefetch(stream)
     return output
+
+
+def _all_reduce_with_weight_prefetch_fake(
+    output: torch.Tensor, weight: torch.Tensor, ratio: float, reduce_first: bool
+) -> torch.Tensor:
+    return torch.empty_like(output)
 
 
 def _prefetch_size(weight: torch.Tensor, ratio: float) -> int:
     return min(int(weight.numel() * weight.element_size() * ratio), MAX_PREFETCH_WEIGHT_SIZE)
 
 
-def _start_prefetch(
-    weight: torch.Tensor, dependency: torch.Tensor, ratio: float, num_tokens: int | None = None
-):
+def _start_prefetch(weight: torch.Tensor, dependency: torch.Tensor, ratio: float, num_tokens: int | None = None):
     # Decide inside the op: profile_run may trace at a prefill size while
     # ACL graphs are subsequently captured at smaller decode sizes.
     size = _prefetch_size(weight, ratio)
@@ -205,7 +194,7 @@ def prefetch_gemma_rms_norm(
     # decision. Other reductions retain the Norm-overlap fallback.
     prefetched = (
         attention_prefix != ""
-        and x.shape[0] < ALLREDUCE_NORM_FUSE_THRESHOLD
+        and 0 < x.shape[0] < MLP_PREFETCH_TOKEN_THRESHOLD
         and _attention_gate_up_target(attention_prefix) is not None
     )
     stream = None if prefetched else _start_prefetch(weight, x, ratio)
@@ -334,24 +323,20 @@ def dense_mlp_with_prefetch(layer, hidden_states, residual, method):
     hidden_states = torch.ops.vllm.prefetch_swiglu(
         gate_up, mlp.down_proj.weight, float(method.mlp.prefetch_ratio.get("down", 0))
     )
-    # Fork layer N+1's input projection across down_proj's MatMul and its
-    # all-reduce, joining one AddRmsNorm before that weight is read. The PR's
-    # own fork sits in MatmulAllreduceRowParallelOp, which this tree never
-    # instantiates, so route it from here instead. Both ops return a real
-    # tensor that stays on the data path, which keeps the fence in the graph.
-    qkv_target = next_layer_qkv_prefetch_target(layer)
-    if qkv_target is not None and 0 < hidden_states.shape[0] < MLP_PREFETCH_TOKEN_THRESHOLD:
-        qkv_weight, qkv_size = qkv_target
-        hidden_states = torch.ops.vllm.prefetch_preprocess(
-            weight=qkv_weight, start_flag=hidden_states, max_weight_size=qkv_size
-        )
-        hidden_states, _ = mlp.down_proj(hidden_states)
-        hidden_states = torch.ops.vllm.prefetch_postprocess(hidden_states)
-    else:
-        hidden_states, _ = mlp.down_proj(hidden_states)
+    # The row-parallel reduction owns next-layer QKV prefetch. Keeping a
+    # second issue site here both duplicates it and exposes a token gate to
+    # tracing at the prefill shape.
+    hidden_states, _ = mlp.down_proj(hidden_states)
     return hidden_states, residual
 
 
+direct_register_custom_op(
+    op_name="all_reduce_with_weight_prefetch",
+    op_func=all_reduce_with_weight_prefetch,
+    fake_impl=_all_reduce_with_weight_prefetch_fake,
+    mutates_args=[],
+    dispatch_key="PrivateUse1",
+)
 direct_register_custom_op(
     op_name="prefetch_gemma_rms_norm",
     op_func=prefetch_gemma_rms_norm,

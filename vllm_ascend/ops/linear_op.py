@@ -50,8 +50,6 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.logger import logger
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.models.common.ops.sequence_parallel import sp_reduce_scatter
-
-from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.parallel_state import (
     get_mlp_tp_group,
     get_otp_group,
@@ -88,7 +86,7 @@ class CustomLinearOp:
 
     # Update the attributes required by apply(), obtaining them from the layer.
     # Call this after the layer completes its initialization, specifically at the end of layer.init().
-    
+
     def update_attrs(self):
         if hasattr(self.layer, "bias"):
             self.bias = self.layer.bias
@@ -245,9 +243,10 @@ class CustomRowParallelOp(CustomLinearOp):
     def apply(self, input_):
         output, output_bias = self.apply_impl(input_)
         weight_prefetch_method = get_weight_prefetch_method()
-        weight_prefetch_method.maybe_prefetch_mlp_weight_preprocess(
-            weight_prefetch_method.MLP_GATE_UP, output, self.prefix
-        )
+        if weight_prefetch_method is not None:
+            weight_prefetch_method.maybe_prefetch_mlp_weight_preprocess(
+                weight_prefetch_method.MLP_GATE_UP, output, self.prefix
+            )
 
         if not self.return_bias:
             return output

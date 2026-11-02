@@ -752,6 +752,14 @@ class NPUModelRunner(GPUModelRunner):
                     self._dummy_run(mc2_tokens_capacity, skip_attn=True, skip_eplb=True, is_profile=True)
             super().profile_run()
 
+        # One-shot report of the weight-prefetch gate outcomes collected during
+        # the dummy runs above. Reads a plain dict filled at trace time, since
+        # logger calls inside the compiled forward are untraceable.
+        from vllm_ascend.ops.linear import dump_prefetch_probe
+
+        for _pfx, _state in sorted(dump_prefetch_probe().items()):
+            logger.info("[PREFETCH-PROBE] %s -> %s", _pfx, _state)
+
     def gather_batch_req_state(self, scheduler_output: SchedulerOutput, dummy_run: bool):
         batch_state, uniform_token_count = super().gather_batch_req_state(scheduler_output, dummy_run)
         kv_cfg = self.vllm_config.kv_transfer_config
