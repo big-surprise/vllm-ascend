@@ -25,6 +25,7 @@ import torch.nn as nn
 from torch.nn.parameter import Parameter
 from vllm.config import get_current_vllm_config
 from vllm.distributed import divide
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (  # noqa
     WEIGHT_LOADER_V2_SUPPORTED,
     ColumnParallelLinear,
@@ -39,7 +40,6 @@ from vllm.model_executor.layers.linear import (  # noqa
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 from vllm.utils.torch_utils import direct_register_custom_op
-
 from vllm_ascend.device.hardware_profile import HardwareCapability, WeightLayoutPolicy, get_current_hardware_profile
 from vllm_ascend.ops.linear_op import get_parallel_op, get_replicated_op
 from vllm_ascend.utils import maybe_trans_nz
@@ -95,6 +95,17 @@ def _should_reshape_wo_a_to_3d(prefix: str, dtype: torch.dtype) -> bool:
     )
     reshape_bf16_wo_a = "wo_a" in prefix and supports_dynamic_mx_quant_fusion and dtype == torch.bfloat16
     return "wo_a" in prefix and (not supports_dynamic_mx_quant_fusion or reshape_bf16_wo_a)
+
+
+logger = init_logger(__name__)
+
+# Gate outcomes per linear prefix, filled at trace time. Read it from outside
+# the compiled region: logger calls inside forward are untraceable.
+PREFETCH_PROBE: dict[str, str] = {}
+
+
+def dump_prefetch_probe() -> dict[str, str]:
+    return dict(PREFETCH_PROBE)
 
 
 class AscendUnquantizedLinearMethod(WeightSwitchMixin, UnquantizedLinearMethod):
@@ -387,6 +398,34 @@ class AscendRowParallelLinear(RowParallelLinear):
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         if self.custom_op is not None:
             return self.custom_op.apply(input_)
+
+        if not (self.reduce_results and self.tp_size > 1 and self.input_is_parallel):
+            PREFETCH_PROBE[self.prefix] = (
+                f"OUTER_FAIL reduce={self.reduce_results} tp={self.tp_size} in_par={self.input_is_parallel}"
+            )
+
+        # Decode-only weight prefetch window. vllm's RowParallelLinear.forward
+        # hides the matmul/all_reduce seam that the prefetch has to fork from,
+        # so run those two steps here when this layer owns a prefetch target:
+        #   o_proj / out_proj -> this layer's mlp.gate_up_proj
+        #   mlp.down_proj     -> next layer's qkv / in_proj_qkv
+        # Everything else keeps delegating to the base class.
+        if self.reduce_results and self.tp_size > 1 and self.input_is_parallel:
+            from vllm_ascend.ops.mlp_weight_prefetch import _all_reduce_prefetch_target
+
+            _probe_target = _all_reduce_prefetch_target(self.prefix)
+            PREFETCH_PROBE[self.prefix] = "HIT" if _probe_target is not None else "MISS"
+            if _probe_target is not None:
+                bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+                output_parallel = self.quant_method.apply(self, input_, bias_)
+                # Shape gating must happen inside the custom op, after
+                # tracing, so decode captures retain the prefetch path.
+                output = torch.ops.vllm.all_reduce_with_weight_prefetch(
+                    output_parallel, _probe_target[0], _probe_target[1], self.prefix.endswith(".mlp.down_proj")
+                )
+                if not self.return_bias:
+                    return output
+                return output, (self.bias if self.skip_bias_add else None)
 
         return super().forward(input_)
 
