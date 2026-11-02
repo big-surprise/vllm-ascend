@@ -388,6 +388,26 @@ class AscendRowParallelLinear(RowParallelLinear):
         if self.custom_op is not None:
             return self.custom_op.apply(input_)
 
+        # Decode-only weight prefetch window. vllm's RowParallelLinear.forward
+        # hides the matmul/all_reduce seam that the prefetch has to fork from,
+        # so run those two steps here when this layer owns a prefetch target:
+        #   o_proj / out_proj -> this layer's mlp.gate_up_proj
+        #   mlp.down_proj     -> next layer's qkv / in_proj_qkv
+        # Everything else keeps delegating to the base class.
+        if self.reduce_results and self.tp_size > 1 and self.input_is_parallel:
+            from vllm_ascend.ops.mlp_weight_prefetch import (
+                _all_reduce_prefetch_target,
+                attention_all_reduce_with_prefetch,
+            )
+
+            if _all_reduce_prefetch_target(self.prefix) is not None:
+                bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+                output_parallel = self.quant_method.apply(self, input_, bias_)
+                output = attention_all_reduce_with_prefetch(output_parallel, self.prefix)
+                if not self.return_bias:
+                    return output
+                return output, (self.bias if self.skip_bias_add else None)
+
         return super().forward(input_)
 
 

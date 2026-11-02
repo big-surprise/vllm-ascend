@@ -48,11 +48,14 @@ def _attention_gate_up_target(prefix):
         else getattr(attention, "out_proj", None)
     )
     op = getattr(projection, "custom_op", None)
+    # op is None on v030's default path: the fork lives in
+    # AscendRowParallelLinear.forward, between the matmul and the all_reduce.
     if (
-        not isinstance(op, MatmulAllreduceRowParallelOp)
+        not (op is None or isinstance(op, MatmulAllreduceRowParallelOp))
         or projection.prefix != prefix
-        or not op.reduce_results
-        or op.tp_size <= 1
+        # Read these off the linear itself: op is None on v030's default path.
+        or not getattr(projection, 'reduce_results', False)
+        or getattr(projection, 'tp_size', 0) <= 1
         or not hasattr(layer.mlp, "gate_up_proj")
     ):
         return None
@@ -89,7 +92,8 @@ def _next_layer_input_proj_target(prefix):
     # If this down_proj does not route through matmul_and_reduce the fork never
     # runs, so report no target rather than silently doing nothing.
     down = getattr(getattr(layers[idx], "mlp", None), "down_proj", None)
-    if not isinstance(getattr(down, "custom_op", None), MatmulAllreduceRowParallelOp):
+    down_op = getattr(down, "custom_op", None)
+    if not (down_op is None or isinstance(down_op, MatmulAllreduceRowParallelOp)):
         return None
     return weight, float(method.attn.prefetch_ratio.get("qkv", 0))
 
