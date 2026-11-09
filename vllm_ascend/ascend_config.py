@@ -189,10 +189,14 @@ class AscendFusionConfig:
             (``vllm_ascend/ops/triton/fused_gdn_gating_l2norm.py``). The fused
             kernel mirrors one specific ``l2norm_fwd`` backend bit for bit and
             is skipped when ``USE_DEFAULT_FLA_NORM`` selects another one.
+        fusion_ops_mega_gdn_decode: Use the xLLM MegaGdnDecode operator for
+            BF16, non-speculative, pure decode batches on Ascend 950. Requires
+            the custom OPP package; unsupported batches keep the existing path.
     """
 
     fusion_ops_gmmswigluquant: bool = True
     fusion_ops_gdn_gate_norm: bool = False
+    fusion_ops_mega_gdn_decode: bool = False
 
 
 @config(config=ConfigDict(frozen=True))
@@ -474,7 +478,8 @@ class AscendConfig:
             },
             "ascend_fusion_config": {
                 "fusion_ops_gmmswigluquant": true,
-                "fusion_ops_gdn_gate_norm": false
+                "fusion_ops_gdn_gate_norm": false,
+                "fusion_ops_mega_gdn_decode": false
             },
             "ascend_warmup_config": {
                 "enable_early_kernel_warmup": false,
