@@ -351,6 +351,22 @@ def _count_nans_per_row(logits: torch.Tensor) -> torch.Tensor:
     return logits.isnan().sum(dim=-1).to(dtype=torch.int32)
 
 
+def _wait_event_if_needed(event: torch.npu.Event) -> None:
+    """Wait for ``event`` only when it has not completed yet.
+
+    ``Event.synchronize()`` always enters the ACL runtime
+    (``aclrtSynchronizeEvent``), even when the event was already signalled.
+    For the per-step events of the decode loop the producer is launched a full
+    iteration earlier, so in steady state the event is already complete and the
+    ACL round trip is pure per-step host overhead. ``Event.query()`` is a
+    cheap, non-blocking status read on the same stream, so query first and only
+    pay for the real wait when the device has actually not caught up
+    (first iterations, prefill->decode transition, graph re-capture).
+    """
+    if not event.query():
+        event.synchronize()
+
+
 class ExecuteModelState(NamedTuple):
     """Ephemeral cached state transferred between execute_model() and
     sample_tokens(), after execute_model() returns None."""
@@ -1492,7 +1508,7 @@ class NPUModelRunner(GPUModelRunner):
         # Sync num_accepted_tokens from CPU (set by
         # _update_states_after_model_execute for hybrid models).
         if self.num_accepted_tokens_event is not None:
-            self.num_accepted_tokens_event.synchronize()
+            _wait_event_if_needed(self.num_accepted_tokens_event)
             self._sync_num_accepted_tokens(
                 num_reqs, has_prev_mapping=bool(prev_req_id_to_index)
             )
@@ -1864,7 +1880,7 @@ class NPUModelRunner(GPUModelRunner):
         """
         assert self.valid_sampled_token_count_event is not None
         assert self.valid_sampled_token_count_cpu is not None
-        self.valid_sampled_token_count_event.synchronize()
+        _wait_event_if_needed(self.valid_sampled_token_count_event)
         correct_optimistic_seq_lens_cpu(
             self.optimistic_seq_lens_cpu.numpy(),
             self.prev_positions.np,

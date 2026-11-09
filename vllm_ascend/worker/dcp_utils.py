@@ -415,7 +415,11 @@ class DCPManager:
         base_num_computed_tokens = num_computed_tokens_cpu[:num_reqs].copy()
         assert valid_sampled_token_count_event is not None
         assert valid_sampled_token_count_cpu is not None
-        valid_sampled_token_count_event.synchronize()
+        # The D2H copy that signals this event was launched a full step earlier,
+        # so in steady state it is already complete and synchronize() would only
+        # pay the ACL round trip (aclrtSynchronizeEvent is a per-step host cost).
+        if not valid_sampled_token_count_event.query():
+            valid_sampled_token_count_event.synchronize()
         correct_optimistic_seq_lens_cpu(
             base_num_computed_tokens,
             prev_positions_np,
