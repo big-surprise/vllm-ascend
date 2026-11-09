@@ -545,6 +545,12 @@ vllm serve your_model_path \
     --gpu-memory-utilization 0.9
 ```
 
+Weight prefetch also supports Model Runner V2. Set `VLLM_USE_V2_MODEL_RUNNER=1`
+and retain `"weight_prefetch_config":{"enabled":true}` in `--additional-config`.
+The existing prefetch ratios and token thresholds apply. V2 initializes the
+model reference and layer cursor before eager execution and graph capture;
+full graph replay executes the captured prefetch operations.
+
 <u>Long Context Configuration:</u>
 
 ```bash
