@@ -426,6 +426,21 @@ def select_moe_comm_method(
     return moe_comm_type
 
 
+def set_weight_prefetch_context(model: torch.nn.Module, _inputs: tuple[Any, ...]) -> None:
+    """Initialize model-owned prefetch state before a V2 model forward.
+
+    Registered on the outer model, outside its compiled decoder. This runs
+    for eager execution, profiling and each graph-capture warmup, while full
+    graph replay uses the weights and stream dependencies captured earlier.
+    Resolve the actual caller so target and draft never share a layer cursor.
+    """
+    inner_model = get_inner_model(model)
+    _EXTRA_CTX.model_instance = model
+    _EXTRA_CTX.layer_idx = inner_model.start_layer if inner_model is not None else None
+    _EXTRA_CTX.prefetch_mlp_gate_up_proj = False
+    _EXTRA_CTX.prefetch_mlp_down_proj = False
+
+
 class _ExtraForwardContextProxy:
     """Unified forward-context access for v1/v2 model runners."""
 

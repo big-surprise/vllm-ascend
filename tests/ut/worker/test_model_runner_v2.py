@@ -35,6 +35,7 @@ def _make_runner(need_timing: bool = True):
     runner.ascend_config = SimpleNamespace(
         scheduler_config=SimpleNamespace(profiling_chunk_config=SimpleNamespace(need_timing=need_timing)),
         sparse_kv_offload_config=SimpleNamespace(enabled=False),
+        weight_prefetch_config=SimpleNamespace(enabled=False),
     )
     runner.vllm_config = SimpleNamespace(kv_transfer_config=None)
     runner.model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type="other_model"))
@@ -796,6 +797,7 @@ def test_load_model_original_profiler_counts_post_load_weights(monkeypatch, with
     monkeypatch.setattr(vllm_model_runner, "get_offloader", NoopOffloader)
     monkeypatch.setattr("vllm_ascend.attention.mla_v1.get_offloader", NoopOffloader)
     monkeypatch.setattr("vllm_ascend.attention.mla_v1.maybe_trans_nz", lambda tensor: tensor)
+    monkeypatch.setattr("torch_npu.npu_format_cast", lambda tensor, *_args: tensor)
     monkeypatch.setattr("vllm_ascend.worker.v2.model_runner.get_pd_dspark_aux_layer_ids", lambda _config: ())
 
     runner.load_model()
@@ -1004,7 +1006,11 @@ def _parent_init(self, vllm_config, device, *, full_graph=False, speculative=Fal
 
 def test_init_without_spec_pp():
     vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(enable_eplb=False))
-    ascend_config = SimpleNamespace(eplb_config=SimpleNamespace(load_collection_phase="all"), dump_config_path=None)
+    ascend_config = SimpleNamespace(
+        eplb_config=SimpleNamespace(load_collection_phase="all"),
+        dump_config_path=None,
+        weight_prefetch_config=SimpleNamespace(enabled=False),
+    )
 
     # Complete the fake with the fields NPUModelRunner reads (mirrors FinegrainedTPConfig).
     ascend_config.finegrained_tp_config = SimpleNamespace(
@@ -1015,6 +1021,7 @@ def test_init_without_spec_pp():
     )
     with (
         patch("vllm_ascend.worker.v2.model_runner.get_ascend_config", return_value=ascend_config),
+        patch("vllm_ascend.worker.v2.model_runner.set_weight_prefetch_method"),
         patch("vllm_ascend.worker.v2.model_runner.set_potential_max_tokens"),
         patch("vllm_ascend.worker.v2.model_runner.resolve_spec_pp_support", return_value=None),
         patch("vllm_ascend.worker.v2.model_runner.torch_cuda_wrapper", return_value=nullcontext()),
@@ -1049,7 +1056,11 @@ def test_init_without_spec_pp():
 
 def test_init_spec_pp_full_graph_and_speculator():
     vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(enable_eplb=True))
-    ascend_config = SimpleNamespace(eplb_config=SimpleNamespace(load_collection_phase="decode"), dump_config_path=None)
+    ascend_config = SimpleNamespace(
+        eplb_config=SimpleNamespace(load_collection_phase="decode"),
+        dump_config_path=None,
+        weight_prefetch_config=SimpleNamespace(enabled=False),
+    )
 
     # Complete the fake with the fields NPUModelRunner reads (mirrors FinegrainedTPConfig).
     ascend_config.finegrained_tp_config = SimpleNamespace(
@@ -1062,6 +1073,7 @@ def test_init_spec_pp_full_graph_and_speculator():
     speculator = SimpleNamespace()
     with (
         patch("vllm_ascend.worker.v2.model_runner.get_ascend_config", return_value=ascend_config),
+        patch("vllm_ascend.worker.v2.model_runner.set_weight_prefetch_method"),
         patch("vllm_ascend.worker.v2.model_runner.set_potential_max_tokens"),
         patch("vllm_ascend.worker.v2.model_runner.resolve_spec_pp_support", return_value=spec_pp),
         patch("vllm_ascend.worker.v2.model_runner.torch_cuda_wrapper", return_value=nullcontext()),

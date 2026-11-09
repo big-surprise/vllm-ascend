@@ -59,6 +59,7 @@ from vllm_ascend.ascend_forward_context import (
     select_moe_comm_method,
     set_mc2_mask,
     set_mc2_tokens_capacity,
+    set_weight_prefetch_context,
 )
 from vllm_ascend.attention.attention_c8_mxfp import (
     AscendC8MXFPAttentionBackendImpl,
@@ -100,11 +101,11 @@ from vllm_ascend.utils import (
     lmhead_tp_max_num_logits,
     lmhead_tp_pad_rows,
     set_potential_max_tokens,
+    set_weight_prefetch_method,
     should_skip_allreduce_across_dp_group,
 )
 from vllm_ascend.worker.device_metadata import TargetDeviceMetadata
 from vllm_ascend.worker.utils import disable_compilation
-from vllm_ascend.utils import set_weight_prefetch_method
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import (
     build_attn_state,
@@ -307,6 +308,14 @@ class NPUModelRunner(GPUModelRunner):
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
         aux_layers = get_pd_dspark_aux_layer_ids(self.vllm_config)
         super().load_model(load_dummy_weights, *args, **kwargs)
+        if self.ascend_config.weight_prefetch_config.enabled:
+            # Upstream V2 creates ForwardContext without a model reference.
+            # Bind at the actual model call, including graph-capture wrappers,
+            # so each warmup/forward resets the cursor to this PP rank's start.
+            self.model.register_forward_pre_hook(set_weight_prefetch_context)
+            draft_model = self.get_draft_model()
+            if draft_model is not None and draft_model is not self.model:
+                draft_model.register_forward_pre_hook(set_weight_prefetch_context)
         self.pd_dspark_aux_layer_ids = aux_layers
         # In cudagraph modes the dumper must be started before graph capture so
         # that aclgraph capture/replay is instrumented (v1 parity: v1 starts
