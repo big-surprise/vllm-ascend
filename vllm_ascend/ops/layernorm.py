@@ -21,6 +21,7 @@ from vllm.config import get_current_vllm_config
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm, RMSNormGated
 
 from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.ops.gemma_norm_weight import gemma_norm_weight, refresh_gemma_norm_weight
 from vllm_ascend.ops.triton.layernorm_gated import layer_norm_fwd_npu
 from vllm_ascend.utils import enable_custom_op, get_weight_prefetch_method
 
@@ -104,6 +105,19 @@ class AscendRMSNorm(RMSNorm):
 
 
 class AscendGemmaRMSNorm(GemmaRMSNorm):
+    def _apply(self, fn, recurse=True):
+        result = super()._apply(fn, recurse=recurse)
+        if getattr(self, "_ascend_effective_weight", None) is not None:
+            # Recompute from raw weights instead of casting an already rounded
+            # effective scale. Device/dtype changes require graph recapture.
+            refresh_gemma_norm_weight(self)
+        return result
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        super()._load_from_state_dict(*args, **kwargs)
+        if getattr(self, "_ascend_effective_weight", None) is not None:
+            refresh_gemma_norm_weight(self)
+
     def forward_oot(
         self,
         x: torch.Tensor,
@@ -114,13 +128,16 @@ class AscendGemmaRMSNorm(GemmaRMSNorm):
         if residual is not None:
             if enable_custom_op():
                 x, _, residual = torch.ops._C_ascend.npu_add_rms_norm_bias(
-                    x, residual, 1.0 + self.weight, None, self.variance_epsilon
+                    x, residual, gemma_norm_weight(self), None, self.variance_epsilon
                 )
             else:
-                x, _, residual = torch_npu.npu_add_rms_norm(x, residual, 1.0 + self.weight, self.variance_epsilon)
+                x, _, residual = torch_npu.npu_add_rms_norm(x, residual, gemma_norm_weight(self), self.variance_epsilon)
             return x, residual
 
-        x = DeviceOperator.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
+        if getattr(self, "_ascend_effective_weight", None) is not None and not torch.is_grad_enabled():
+            x, _ = torch_npu.npu_rms_norm(x, self._ascend_effective_weight, self.variance_epsilon)
+        else:
+            x = DeviceOperator.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
 
         return x
 

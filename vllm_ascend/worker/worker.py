@@ -95,12 +95,14 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     plan_sparse_kv_offload_memory,
 )
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
+from vllm_ascend.ops.gemma_norm_weight import refresh_model_gemma_norm_weights
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
 from vllm_ascend.utils import (
     check_ascend_device_type,
     enable_custom_op,
     enable_sp,
+    is_950,
     register_ascend_customop,
     register_ascend_fla_customop,
     register_device_print,
@@ -334,6 +336,7 @@ class NPUWorker(WorkerBase):
             )
 
         self._check_nz_disabled()
+        self.synchronize_device()
 
         assert self.weight_transfer_engine is not None
         self.weight_transfer_engine.start_weight_update()
@@ -363,6 +366,8 @@ class NPUWorker(WorkerBase):
 
         assert self.weight_transfer_engine is not None
         self.weight_transfer_engine.finish_weight_update()
+        self._refresh_gemma_norm_weights()
+        self.synchronize_device()
         self.model_runner.reset_lora_state()
         self._weight_update_active = False
 
@@ -863,6 +868,7 @@ class NPUWorker(WorkerBase):
 
         with context, set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
+            self._refresh_gemma_norm_weights()
 
         if self.vllm_config.weight_transfer_config is not None:
             from vllm.distributed.weight_transfer.factory import (
@@ -1316,7 +1322,23 @@ class NPUWorker(WorkerBase):
         self.model_runner.update_config(overrides)
 
     def reload_weights(self, *args, **kwargs) -> None:
+        self.synchronize_device()
         self.model_runner.reload_weights(*args, **kwargs)
+        self._refresh_gemma_norm_weights()
+        self.synchronize_device()
+
+    def _refresh_gemma_norm_weights(self) -> None:
+        if not is_950():
+            return
+        model_type = getattr(self.model_config.hf_text_config, "model_type", "")
+        if not model_type.startswith("qwen3_5"):
+            return
+        model = self.model_runner.get_model()
+        refresh_model_gemma_norm_weights(model)
+        get_draft_model = getattr(self.model_runner, "get_draft_model", None)
+        draft = get_draft_model() if get_draft_model is not None else None
+        if draft is not None and draft is not model:
+            refresh_model_gemma_norm_weights(draft)
 
     def check_health(self) -> None:
         import subprocess

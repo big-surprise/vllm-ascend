@@ -37,6 +37,7 @@ except ImportError:
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.models.common.ops.sequence_parallel import sp_all_gather, sp_reduce_scatter
 from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention, initialize_packed_conv_weight
+from vllm_ascend.ops.gemma_norm_weight import gemma_norm_weight
 from vllm_ascend.ops.mlp_weight_prefetch import dense_mlp_with_prefetch
 from vllm_ascend.ops.shared_quant_proj import project_with_shared_quant
 from vllm_ascend.patch.worker.patch_qwen3_5_gdn_split import apply_gdn_qkv_split_patch
@@ -93,8 +94,8 @@ class AscendQwen3NextAttention(Qwen3NextAttention):
 
             q, k, v, gate = torch.ops.vllm.triton_split_qkv_rmsnorm_mrope(
                 qkv=qkv,
-                q_weight=1.0 + self.q_norm.weight,
-                k_weight=1.0 + self.k_norm.weight,
+                q_weight=gemma_norm_weight(self.q_norm),
+                k_weight=gemma_norm_weight(self.k_norm),
                 cos_sin=cos_sin,
                 num_q_heads=self.num_heads,
                 num_kv_heads=self.num_kv_heads,
