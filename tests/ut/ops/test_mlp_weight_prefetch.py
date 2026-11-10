@@ -6,8 +6,24 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+
 from vllm_ascend.ops import mlp_weight_prefetch as prefetch
 from vllm_ascend.ops.linear import AscendRowParallelLinear
+
+
+@pytest.mark.parametrize("effective", [False, True])
+def test_prefetch_gemma_accepts_raw_or_effective_scale(monkeypatch, effective):
+    from unittest.mock import Mock
+
+    monkeypatch.setattr(prefetch, "_start_prefetch", lambda *args: None)
+    monkeypatch.setattr(prefetch, "enable_custom_op", lambda: False)
+    kernel = Mock(side_effect=lambda x, r, w, eps: (x, None, r))
+    monkeypatch.setattr(prefetch.torch_npu, "npu_add_rms_norm", kernel)
+    x = torch.randn(1, 8)
+    raw = torch.randn(8)
+    scale = 1.0 + raw if effective else raw
+    prefetch.prefetch_gemma_rms_norm(x, x, scale, torch.empty(8, 8), 1e-6, 0.0, "", effective)
+    torch.testing.assert_close(kernel.call_args.args[2], 1.0 + raw, rtol=0, atol=0)
 
 
 @pytest.fixture

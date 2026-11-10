@@ -12,7 +12,9 @@ import torch
 import torch_npu
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.utils.torch_utils import direct_register_custom_op
+
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.ops.gemma_norm_weight import gemma_norm_weight
 from vllm_ascend.ops.weight_prefetch import MAX_PREFETCH_WEIGHT_SIZE, layer_idx_from_prefix, layers_of_model_instance
 from vllm_ascend.utils import enable_custom_op, get_weight_prefetch_method, npu_stream_switch, prefetch_stream
 
@@ -189,6 +191,7 @@ def prefetch_gemma_rms_norm(
     epsilon: float,
     ratio: float,
     attention_prefix: str = "",
+    effective_norm_weight: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # Repeat the runtime eligibility check, not a Python trace-time token
     # decision. Other reductions retain the Norm-overlap fallback.
@@ -198,12 +201,11 @@ def prefetch_gemma_rms_norm(
         and _attention_gate_up_target(attention_prefix) is not None
     )
     stream = None if prefetched else _start_prefetch(weight, x, ratio)
+    scale = norm_weight if effective_norm_weight else 1.0 + norm_weight
     if enable_custom_op():
-        output, _, residual_out = torch.ops._C_ascend.npu_add_rms_norm_bias(
-            x, residual, 1.0 + norm_weight, None, epsilon
-        )
+        output, _, residual_out = torch.ops._C_ascend.npu_add_rms_norm_bias(x, residual, scale, None, epsilon)
     else:
-        output, _, residual_out = torch_npu.npu_add_rms_norm(x, residual, 1.0 + norm_weight, epsilon)
+        output, _, residual_out = torch_npu.npu_add_rms_norm(x, residual, scale, epsilon)
     _finish_prefetch(stream)
     return output, residual_out
 
@@ -216,6 +218,7 @@ def _prefetch_gemma_rms_norm_fake(
     epsilon: float,
     ratio: float,
     attention_prefix: str = "",
+    effective_norm_weight: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.empty_like(x), torch.empty_like(residual)
 
@@ -313,11 +316,12 @@ def dense_mlp_with_prefetch(layer, hidden_states, residual, method):
     hidden_states, residual = torch.ops.vllm.prefetch_gemma_rms_norm(
         hidden_states,
         residual,
-        norm.weight,
+        gemma_norm_weight(norm),
         mlp.gate_up_proj.weight,
         norm.variance_epsilon,
         float(method.mlp.prefetch_ratio.get("gate_up", 0)),
         attention_prefix,
+        True,
     )
     gate_up, _ = mlp.gate_up_proj(hidden_states)
     hidden_states = torch.ops.vllm.prefetch_swiglu(

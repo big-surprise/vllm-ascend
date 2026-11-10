@@ -187,3 +187,69 @@ def test_norm_bias_lookup_handles_empty_description(clean_norm_bias_cache):
     assert ascend_layernorm._quant_description_has_norm_bias({}) is False
     assert ascend_layernorm._quant_description_has_norm_bias(None) is False
     assert not ascend_layernorm._NORM_BIAS_IN_QUANT_DESCRIPTION
+
+
+def test_gemma_effective_weight_preserves_raw_state_dict(default_vllm_config):
+    from vllm_ascend.ops.gemma_norm_weight import gemma_norm_weight, refresh_gemma_norm_weight
+
+    norm = ascend_layernorm.AscendGemmaRMSNorm(8).to(dtype=torch.bfloat16)
+    raw = torch.randn_like(norm.weight)
+    norm.weight.data.copy_(raw)
+    refresh_gemma_norm_weight(norm)
+    with torch.no_grad():
+        actual = gemma_norm_weight(norm)
+        torch.testing.assert_close(actual, 1.0 + raw, rtol=0, atol=0)
+        assert gemma_norm_weight(norm) is actual
+    torch.testing.assert_close(norm.weight, raw, rtol=0, atol=0)
+    assert list(norm.state_dict()) == ["weight"]
+
+
+def test_gemma_refresh_is_idempotent_and_tracks_data_copy(default_vllm_config):
+    from vllm_ascend.ops.gemma_norm_weight import refresh_gemma_norm_weight
+
+    norm = ascend_layernorm.AscendGemmaRMSNorm(8).to(dtype=torch.bfloat16)
+    refresh_gemma_norm_weight(norm)
+    buf = norm._ascend_effective_weight
+    version = norm.weight._version
+    norm.weight.data.fill_(2)
+    assert norm.weight._version == version
+    refresh_gemma_norm_weight(norm)
+    refresh_gemma_norm_weight(norm)
+    assert norm._ascend_effective_weight is buf
+    torch.testing.assert_close(buf, torch.full_like(buf, 3), rtol=0, atol=0)
+    assert torch.equal(norm.weight, torch.full_like(norm.weight, 2))
+
+
+def test_gemma_dtype_change_recomputes_from_raw(default_vllm_config):
+    from vllm_ascend.ops.gemma_norm_weight import refresh_gemma_norm_weight
+
+    norm = ascend_layernorm.AscendGemmaRMSNorm(8).to(dtype=torch.bfloat16)
+    norm.weight.data.fill_(0.001)
+    refresh_gemma_norm_weight(norm)
+    rounded = norm._ascend_effective_weight.float().clone()
+    norm.float()
+    torch.testing.assert_close(norm._ascend_effective_weight, 1.0 + norm.weight, rtol=0, atol=0)
+    assert not torch.equal(rounded, norm._ascend_effective_weight)
+
+
+def test_gemma_load_state_dict_refreshes_fixed_address(default_vllm_config):
+    from vllm_ascend.ops.gemma_norm_weight import refresh_gemma_norm_weight
+
+    norm = ascend_layernorm.AscendGemmaRMSNorm(8)
+    refresh_gemma_norm_weight(norm)
+    ptr = norm._ascend_effective_weight.data_ptr()
+    norm.load_state_dict({"weight": torch.full((8,), 4.0)})
+    assert norm._ascend_effective_weight.data_ptr() == ptr
+    torch.testing.assert_close(norm._ascend_effective_weight, torch.full((8,), 5.0), rtol=0, atol=0)
+
+
+def test_gemma_grad_enabled_uses_raw_weight(default_vllm_config):
+    from vllm_ascend.ops.gemma_norm_weight import gemma_norm_weight, refresh_gemma_norm_weight
+
+    norm = ascend_layernorm.AscendGemmaRMSNorm(8)
+    refresh_gemma_norm_weight(norm)
+    with torch.enable_grad():
+        actual = gemma_norm_weight(norm)
+        assert actual is not norm._ascend_effective_weight
+        actual.sum().backward()
+    torch.testing.assert_close(norm.weight.grad, torch.ones(8))

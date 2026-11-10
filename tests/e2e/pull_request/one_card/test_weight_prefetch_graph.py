@@ -14,6 +14,63 @@ from vllm_ascend.ops.linear import AscendRowParallelLinear
 from vllm_ascend.worker.v2.aclgraph_utils import ModelWithContext
 
 
+@pytest.mark.parametrize("batch", [1, 4, 16])
+@pytest.mark.parametrize("residual", [False, True])
+@torch.inference_mode()
+def test_precomputed_gemma_norm_matches_original(batch, residual):
+    from vllm_ascend.ops.gemma_norm_weight import refresh_gemma_norm_weight
+    from vllm_ascend.ops.layernorm import AscendGemmaRMSNorm
+
+    norm = AscendGemmaRMSNorm.__new__(AscendGemmaRMSNorm)
+    torch.nn.Module.__init__(norm)
+    norm.weight = torch.nn.Parameter(torch.randn(5120, device="npu", dtype=torch.bfloat16))
+    norm.variance_epsilon = 1e-6
+    x = torch.randn(batch, 5120, device="npu", dtype=torch.bfloat16)
+    r = torch.randn_like(x) if residual else None
+    before = norm.forward_oot(x, r)
+    refresh_gemma_norm_weight(norm)
+    after = norm.forward_oot(x, r)
+    torch.npu.synchronize()
+    torch.testing.assert_close(after, before, rtol=0, atol=0)
+
+
+@torch.inference_mode()
+def test_precomputed_prefetch_gemma_capture_and_reload():
+    from vllm_ascend.ops.gemma_norm_weight import gemma_norm_weight, refresh_gemma_norm_weight
+    from vllm_ascend.ops.layernorm import AscendGemmaRMSNorm
+
+    norm = AscendGemmaRMSNorm.__new__(AscendGemmaRMSNorm)
+    torch.nn.Module.__init__(norm)
+    norm.weight = torch.nn.Parameter(torch.randn(5120, device="npu", dtype=torch.bfloat16))
+    norm.variance_epsilon = 1e-6
+    x = torch.randn(1, 5120, device="npu", dtype=torch.bfloat16)
+    residual = torch.randn_like(x)
+    target = torch.randn(128, 5120, device="npu", dtype=torch.bfloat16)
+    refresh_gemma_norm_weight(norm)
+
+    def forward(x, residual, scale):
+        return torch.ops.vllm.prefetch_gemma_rms_norm(x, residual, scale, target, 1e-6, 1.0, "", True)
+
+    compiled = torch.compile(forward, backend="eager", fullgraph=True)
+    for _ in range(3):
+        compiled(x, residual, gemma_norm_weight(norm))
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        actual = compiled(x, residual, gemma_norm_weight(norm))
+    ptr = norm._ascend_effective_weight.data_ptr()
+    for _ in range(3):
+        torch.npu.synchronize()
+        norm.weight.data.copy_(torch.randn_like(norm.weight))
+        refresh_gemma_norm_weight(norm)
+        graph.replay()
+        torch.npu.synchronize()
+        expected = torch.ops.vllm.prefetch_gemma_rms_norm(x, residual, norm.weight, target, 1e-6, 1.0)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert ptr == norm._ascend_effective_weight.data_ptr()
+    torch._dynamo.reset()
+
+
 @pytest.mark.parametrize("reduce_first", [False, True])
 @torch.inference_mode()
 def test_prefetch_survives_prefill_compile_and_decode_capture(monkeypatch, reduce_first):
