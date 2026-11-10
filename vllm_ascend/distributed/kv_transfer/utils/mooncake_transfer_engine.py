@@ -23,7 +23,7 @@ class GlobalTE:
                         ) from e
                     self.transfer_engine = TransferEngine()
                     device_name = device_name if device_name is not None else ""
-                    ret_value = self.transfer_engine.initialize(hostname, "P2PHANDSHAKE", "ascend", device_name)
+                    ret_value = self.transfer_engine.initialize(hostname, "P2PHANDSHAKE", "rdma", "mlx5_bond_0")
                     if ret_value != 0:
                         raise RuntimeError(f"TransferEngine initialization failed with ret_value: {ret_value}")
         return self.transfer_engine
