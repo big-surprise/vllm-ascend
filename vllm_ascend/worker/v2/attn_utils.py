@@ -367,6 +367,87 @@ def _get_parallel_config_for_attn_metadata(attn_groups: list[list[AttentionGroup
     return vllm_config.parallel_config if vllm_config is not None else None
 
 
+def _gdn_metadata_reuse_enabled() -> bool:
+    """Read the GDN metadata reuse switch from ``--additional-config``."""
+    try:
+        return bool(get_ascend_config().enable_gdn_metadata_reuse)
+    except RuntimeError:
+        # Unit tests and standalone tooling may call build_attn_metadata
+        # without initializing AscendConfig. Keep the original per-group
+        # build path in that case instead of failing.
+        return False
+
+
+def _gdn_group_spec_key(group_spec: Any) -> Any:
+    """Reduce a hybrid KV cache group spec to a group-independent identity.
+
+    vLLM wraps interleaved hybrid layers in ``UniformTypeKVCacheSpecs``, a
+    mapping from layer name to spec. Layer names differ between groups, so
+    hashing the wrapper would give every group a distinct template key and
+    silently disable reuse. Homogeneous wrappers are reduced to their common
+    underlying spec, which is what ``build()`` actually depends on.
+    """
+    layer_specs = getattr(group_spec, "kv_cache_specs", None)
+    if isinstance(layer_specs, dict) and layer_specs:
+        specs = list(layer_specs.values())
+        if all(spec == specs[0] for spec in specs):
+            return specs[0]
+    return group_spec
+
+
+def _gdn_template_reuse_key(
+    *,
+    enabled: bool,
+    builder: Any,
+    group_spec: Any,
+    group_causal: bool,
+    num_metadata_variants: int,
+    pcp_context: Any,
+    extra_kwargs: Mapping[str, Any],
+) -> tuple[Any, ...] | None:
+    """Return the per-call template key when GDN metadata reuse is safe.
+
+    The decision is derived only from static group and builder properties.
+    Together with ``update_block_table``'s shape-based fallback this keeps
+    FULL_DECODE_ONLY capture and replay on the same code path. ``None``
+    disables reuse for this group and the caller builds metadata normally.
+    """
+    if not enabled:
+        return None
+    if not isinstance(builder, GDNAttentionMetadataBuilder):
+        return None
+    if not getattr(builder, "supports_update_block_table", False):
+        return None
+    if not callable(getattr(builder, "update_block_table", None)):
+        return None
+    # Multiple metadata variants may need different batch-level fields, so a
+    # single template cannot describe them all.
+    if num_metadata_variants != 1:
+        return None
+    if pcp_context is not None:
+        return None
+    # MambaHybridAttnMetadata always passes its spec-decode kwargs for GDN
+    # builders, with None values when speculative decoding is off. Only real
+    # per-builder extras can make batch-level metadata group-specific, so
+    # None-valued entries must not block reuse on the plain decode path.
+    if any(value is not None for value in extra_kwargs.values()):
+        return None
+    # init_attn_backend unwraps UniformTypeKVCacheSpecs and hands each
+    # builder its own per-layer spec, so builders serving identically
+    # specified GDN layers carry equal specs across KV cache groups even
+    # when the group-level wrappers differ by layer name or mix in the
+    # group's full-attention layers. The builder spec is the identity the
+    # template actually depends on; fall back to the normalized group spec.
+    normalized_spec = getattr(builder, "kv_cache_spec", None)
+    if normalized_spec is None:
+        normalized_spec = _gdn_group_spec_key(group_spec)
+    try:
+        hash(normalized_spec)
+    except TypeError:
+        return (type(builder), repr(normalized_spec), group_causal)
+    return (type(builder), normalized_spec, group_causal)
+
+
 def build_attn_metadata(
     *,
     attn_groups: list[list[AttentionGroup]],
@@ -493,6 +574,14 @@ def build_attn_metadata(
                 dsa_builder.tq_group_block_sizes = block_sizes
             plan = get_dsa_attn_kv_plan(dsa_builder.vllm_config, dsa_builder.compressor_ratio)
             formatted_slot_mappings = plan.format_dsa_slot_mapping(slot_mappings[:, :num_input_tokens], block_sizes)
+    # Hybrid models create one attention metadata object per KV cache group.
+    # Groups sharing a spec have identical batch-level metadata, so the first
+    # group's object is kept as a template and the remaining groups only
+    # rebind their own physical state views. Eligibility is derived from static
+    # group/builder properties and the template shape, never from the step
+    # index, so FULL_DECODE_ONLY capture and replay take the same path.
+    gdn_reuse_enabled = _gdn_metadata_reuse_enabled()
+    gdn_metadata_templates: dict[Any, Any] = {}
     for i, kv_cache_spec in enumerate(kv_cache_groups):
         block_table = block_tables[i]
         slot_mapping = slot_mappings[i]
@@ -595,20 +684,44 @@ def build_attn_metadata(
                     pcp_cache_group_idx=i,
                 )
 
+            group_spec = getattr(kv_cache_spec, "kv_cache_spec", kv_cache_spec)
+            template_key = _gdn_template_reuse_key(
+                enabled=gdn_reuse_enabled,
+                builder=attn_metadata_builder,
+                group_spec=group_spec,
+                group_causal=group_causal,
+                num_metadata_variants=len(metadata_variants),
+                pcp_context=pcp_context,
+                extra_kwargs=attn_metadata_extra_kwargs,
+            )
+            gdn_reusable = template_key is not None
+
             for variant_names, variant_common in metadata_variants:
-                if for_cudagraph_capture:
-                    metadata = attn_metadata_builder.build_for_cudagraph_capture(
-                        variant_common,
-                        **attn_metadata_extra_kwargs,
-                    )
-                else:
-                    if isinstance(attn_metadata_builder, GDNAttentionMetadataBuilder):
-                        attn_metadata_extra_kwargs["num_actual_reqs"] = num_actual_reqs
-                    metadata = attn_metadata_builder.build(
-                        common_prefix_len=0,
-                        common_attn_metadata=variant_common,
-                        **attn_metadata_extra_kwargs,
-                    )
+                metadata = None
+                if gdn_reusable:
+                    template = gdn_metadata_templates.get(template_key)
+                    if template is not None:
+                        metadata = attn_metadata_builder.update_block_table(
+                            template,
+                            variant_common,
+                            num_actual_reqs,
+                        )
+                if metadata is None:
+                    if for_cudagraph_capture:
+                        metadata = attn_metadata_builder.build_for_cudagraph_capture(
+                            variant_common,
+                            **attn_metadata_extra_kwargs,
+                        )
+                    else:
+                        if isinstance(attn_metadata_builder, GDNAttentionMetadataBuilder):
+                            attn_metadata_extra_kwargs["num_actual_reqs"] = num_actual_reqs
+                        metadata = attn_metadata_builder.build(
+                            common_prefix_len=0,
+                            common_attn_metadata=variant_common,
+                            **attn_metadata_extra_kwargs,
+                        )
+                    if gdn_reusable:
+                        gdn_metadata_templates[template_key] = metadata
                 if is_dsa_builder:
                     # Preserve sharing even if a builder replaces one of the
                     # dictionaries while constructing its metadata.

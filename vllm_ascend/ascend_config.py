@@ -439,6 +439,7 @@ class AscendConfig:
         {
             "refresh": false,
             "enable_cpu_binding": true,
+            "enable_gdn_metadata_reuse": false,
             "multistream_dsv4_dsa_overlap": true,
             "multistream_engram_overlap": true,
             "enable_prefill_mc2": false,
@@ -587,6 +588,11 @@ class AscendConfig:
 
     # ---- user-input switches: bool/int/list/str, auto type validation ----
     enable_cpu_binding: bool = True
+    # Reuse GDN/hybrid attention metadata templates across KV cache groups
+    # during plain decode. Opt-in: only Model Runner V2, PCP size 1 and batches
+    # without prefills or speculative sequences are eligible; every other
+    # configuration falls back to a full per-group metadata build.
+    enable_gdn_metadata_reuse: bool = False
     multistream_dsv4_dsa_overlap: bool = True
     # Prepare Engram hashes, lookups and DP/TP exchanges on an auxiliary stream;
     # FULL graphs wait on descriptor-specific external events at consumers.

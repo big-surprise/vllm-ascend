@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from copy import copy
 from dataclasses import dataclass
 
 import torch
@@ -392,6 +393,33 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 (sequence_index_capacity + 1,), dtype=torch.int32, device=device
             )
 
+        # A shared decode template can only be rebound when the runner exposes
+        # one block table per KV cache group and PCP does not split the batch
+        # across ranks. Model Runner V1 and PCP-enabled runs keep the original
+        # per-group build path.
+        self.supports_update_block_table = bool(
+            getattr(vllm_config, "use_v2_model_runner", False)
+            and getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1) == 1
+        )
+        if not self.supports_update_block_table:
+            # Inline import: keep the ops module free of config-layer import
+            # cycles at module initialization time.
+            from vllm.logger import logger
+
+            from vllm_ascend.ascend_config import get_ascend_config
+
+            try:
+                reuse_requested = bool(get_ascend_config().enable_gdn_metadata_reuse)
+            except RuntimeError:
+                reuse_requested = False
+            if reuse_requested:
+                logger.warning(
+                    "enable_gdn_metadata_reuse is set but inactive: it requires "
+                    "Model Runner V2 (VLLM_USE_V2_MODEL_RUNNER=1) and "
+                    "prefill_context_parallel_size == 1. GDN attention metadata "
+                    "is built per KV cache group on every decode step."
+                )
+
     def _init_reorder_batch_threshold(
         self,
         reorder_batch_threshold: int | None = 1,
@@ -665,6 +693,76 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             actual_request_count,
             graph_request_count,
         )
+
+    def update_block_table(
+        self,
+        template: GDNAttentionMetadata,
+        common_attn_metadata: CommonAttentionMetadata,
+        num_actual_reqs: int | None = None,
+    ) -> GDNAttentionMetadata | None:
+        """Rebind a shared decode template to this group's physical state.
+
+        ``build_attn_metadata`` builds one attention metadata object per KV
+        cache group even though the batch-level fields are identical for all
+        groups sharing a spec. Reusing the first group's object saves one full
+        ``build()`` per remaining group. Only group-local recurrent state
+        views are rebuilt here, and they are materialized in *this* builder's
+        graph buffers, so FULL_DECODE_ONLY capture and replay stay consistent.
+
+        Only plain decode templates are supported: no prefills, no speculative
+        sequences, no prefill descriptors. Every other shape returns ``None``
+        so the caller falls back to a full ``build()``. Eligibility depends
+        only on static builder/group properties and the template shape, never
+        on the step index, which keeps the capture and replay decisions equal.
+        """
+        if not getattr(self, "supports_update_block_table", False):
+            return None
+        if (
+            template.num_prefills != 0
+            or template.num_spec_decodes != 0
+            or template.num_decodes <= 0
+            or getattr(template, "spec_decode_metadata", None) is not None
+            or getattr(template, "non_spec_prefill_metadata", None) is not None
+            or getattr(template, "non_spec_decode_metadata", None) is None
+            or template.non_spec_query_start_loc is None
+        ):
+            return None
+
+        m = common_attn_metadata
+        graph_request_count = m.num_reqs
+        if num_actual_reqs is None:
+            num_actual_reqs = graph_request_count
+        if not 0 <= num_actual_reqs <= graph_request_count:
+            return None
+        if num_actual_reqs < graph_request_count:
+            m = m.unpadded(m.num_actual_tokens, num_actual_reqs)
+        m = _treat_single_token_prefills_with_state_as_decodes(m)
+
+        block_table_tensor = mamba_get_block_table_tensor(
+            m.block_table_tensor,
+            m.seq_lens,
+            self.kv_cache_spec,
+            self.vllm_config.cache_config.mamba_cache_mode,
+        )
+        num_decode_tokens = getattr(template, "num_decode_tokens", None)
+        if num_decode_tokens is None or block_table_tensor.size(0) != num_decode_tokens:
+            return None
+
+        metadata = copy(template)
+        # The template references the owner builder's graph buffers. Rebind
+        # every request-level view before materializing this builder's inputs.
+        metadata.non_spec_query_start_loc = m.query_start_loc
+        metadata.non_spec_state_indices_tensor = block_table_tensor[:, 0]
+        metadata.spec_decode_metadata = None
+        metadata.non_spec_prefill_metadata = None
+
+        non_spec_cache_indices: torch.Tensor = block_table_tensor
+        if self.use_full_cuda_graph and graph_request_count <= self.decode_cudagraph_max_bs:
+            self._pad_decode_metadata(metadata, graph_request_count)
+            non_spec_cache_indices = metadata.non_spec_state_indices_tensor
+
+        self._attach_non_spec_decode_metadata(metadata, non_spec_cache_indices)
+        return metadata
 
     def build(  # type: ignore[override]
         self,
