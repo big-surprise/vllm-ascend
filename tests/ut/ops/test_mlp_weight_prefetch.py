@@ -7,15 +7,25 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_ascend.ascend_config import (
+    WEIGHT_PREFETCH_WINDOW_ATTN_O,
+    WEIGHT_PREFETCH_WINDOW_MLP_DOWN,
+    WEIGHT_PREFETCH_WINDOW_MLP_GATE_UP,
+    WEIGHT_PREFETCH_WINDOW_NEXT_QKV,
+    WeightPrefetchConfig,
+    max_prefetch_weight_size_bytes,
+)
 from vllm_ascend.ops import mlp_weight_prefetch as prefetch
 from vllm_ascend.ops.linear import AscendRowParallelLinear
+
+MIB = 1024 * 1024
 
 
 @pytest.mark.parametrize("effective", [False, True])
 def test_prefetch_gemma_accepts_raw_or_effective_scale(monkeypatch, effective):
     from unittest.mock import Mock
 
-    monkeypatch.setattr(prefetch, "_start_prefetch", lambda *args: None)
+    monkeypatch.setattr(prefetch, "_start_prefetch", lambda *args, **kwargs: None)
     monkeypatch.setattr(prefetch, "enable_custom_op", lambda: False)
     kernel = Mock(side_effect=lambda x, r, w, eps: (x, None, r))
     monkeypatch.setattr(prefetch.torch_npu, "npu_add_rms_norm", kernel)
@@ -75,15 +85,108 @@ def test_runtime_token_gate_and_fence_order(prefetch_runtime, tokens, reduce_fir
 
 
 @pytest.mark.parametrize("ratio", [0.0, 0.5, 1.0])
-def test_ratio_and_byte_cap(prefetch_runtime, monkeypatch, ratio):
-    events, requests = prefetch_runtime
+def test_legacy_ratio_and_byte_cap(monkeypatch, ratio):
     monkeypatch.setattr(prefetch, "MAX_PREFETCH_WEIGHT_SIZE", 64)
-    x, weight = torch.randn(1, 8), torch.empty(4, 8)
-    torch.ops.vllm.all_reduce_with_weight_prefetch(x, weight, ratio, False)
-    if ratio == 0:
-        assert events == ["reduce"]
-    else:
-        assert requests[0][2] == min(int(weight.numel() * weight.element_size() * ratio), 64)
+    weight = torch.empty(4, 8)
+    expected = min(int(weight.numel() * weight.element_size() * ratio), 64)
+    assert prefetch._prefetch_size(weight, ratio) == expected
+
+
+def test_weight_prefetch_config_window_sizes():
+    defaults = WeightPrefetchConfig({}).max_prefetch_weight_size_mb
+    assert defaults[WEIGHT_PREFETCH_WINDOW_ATTN_O] is None
+    assert defaults[WEIGHT_PREFETCH_WINDOW_NEXT_QKV] is None
+    assert defaults[WEIGHT_PREFETCH_WINDOW_MLP_GATE_UP] == 22
+    assert defaults[WEIGHT_PREFETCH_WINDOW_MLP_DOWN] == 8
+
+    config = WeightPrefetchConfig(
+        {"enabled": True, "max_prefetch_weight_size_mb": {"mlp_down": 0, "mlp_gate_up": 28.5}}
+    )
+    caps = max_prefetch_weight_size_bytes(config.max_prefetch_weight_size_mb)
+    assert caps[WEIGHT_PREFETCH_WINDOW_MLP_DOWN] == 0
+    assert caps[WEIGHT_PREFETCH_WINDOW_MLP_GATE_UP] == int(28.5 * MIB)
+    assert config.max_prefetch_weight_size_mb[WEIGHT_PREFETCH_WINDOW_ATTN_O] is None
+    assert caps[WEIGHT_PREFETCH_WINDOW_ATTN_O] is None
+    assert caps[WEIGHT_PREFETCH_WINDOW_NEXT_QKV] is None
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"unknown_window": 8},
+        {"mlp_down": -1},
+        {"mlp_down": "8"},
+        {"mlp_down": True},
+        {"mlp_down": float("nan")},
+        {"mlp_down": float("inf")},
+        "not-a-dict",
+    ],
+)
+def test_weight_prefetch_config_rejects_invalid_window_sizes(raw):
+    with pytest.raises(ValueError):
+        WeightPrefetchConfig({"max_prefetch_weight_size_mb": raw})
+
+
+def test_per_window_caps_full_and_limited(monkeypatch):
+    monkeypatch.setattr(
+        prefetch,
+        "get_weight_prefetch_method",
+        lambda: SimpleNamespace(max_prefetch_weight_size_bytes=max_prefetch_weight_size_bytes(None)),
+    )
+    weight = torch.empty(32 * MIB, dtype=torch.uint8, device="meta")
+    assert prefetch._prefetch_size(weight, 1.0, WEIGHT_PREFETCH_WINDOW_ATTN_O) == 32 * MIB
+    assert prefetch._prefetch_size(weight, 1.0, WEIGHT_PREFETCH_WINDOW_NEXT_QKV) == 32 * MIB
+    assert prefetch._prefetch_size(weight, 1.0, WEIGHT_PREFETCH_WINDOW_MLP_GATE_UP) == 22 * MIB
+    assert prefetch._prefetch_size(weight, 1.0, WEIGHT_PREFETCH_WINDOW_MLP_DOWN) == 8 * MIB
+    assert prefetch._prefetch_size(weight, 0.5, WEIGHT_PREFETCH_WINDOW_ATTN_O) == 16 * MIB
+
+    monkeypatch.setattr(
+        prefetch,
+        "get_weight_prefetch_method",
+        lambda: SimpleNamespace(max_prefetch_weight_size_bytes={WEIGHT_PREFETCH_WINDOW_MLP_DOWN: 0}),
+    )
+    assert prefetch._prefetch_size(weight, 1.0, WEIGHT_PREFETCH_WINDOW_MLP_DOWN) == 0
+    assert prefetch._prefetch_size(weight, 1.0) == prefetch.MAX_PREFETCH_WEIGHT_SIZE
+
+
+def test_runtime_all_reduce_uses_window_caps(prefetch_runtime, monkeypatch):
+    events, requests = prefetch_runtime
+    monkeypatch.setattr(
+        prefetch,
+        "get_weight_prefetch_method",
+        lambda: SimpleNamespace(
+            max_prefetch_weight_size_bytes={
+                WEIGHT_PREFETCH_WINDOW_MLP_GATE_UP: 4 * MIB,
+                WEIGHT_PREFETCH_WINDOW_NEXT_QKV: None,
+            }
+        ),
+    )
+    x = torch.randn(1, 8)
+    weight = torch.empty(16 * MIB, dtype=torch.uint8)
+    torch.ops.vllm.all_reduce_with_weight_prefetch(x, weight, 1.0, False)
+    assert requests[-1][2] == 4 * MIB
+    events.clear()
+    requests.clear()
+    torch.ops.vllm.all_reduce_with_weight_prefetch(x, weight, 1.0, True)
+    assert requests[-1][2] == 16 * MIB
+    assert requests[-1][1] is None
+
+
+@pytest.mark.parametrize("w1_cap,expected_joins", [(0, 0), (None, 1), (4 * MIB, 1)])
+def test_w1_fork_and_join_guards_share_window(monkeypatch, w1_cap, expected_joins):
+    monkeypatch.setattr(
+        prefetch,
+        "get_weight_prefetch_method",
+        lambda: SimpleNamespace(max_prefetch_weight_size_bytes={WEIGHT_PREFETCH_WINDOW_ATTN_O: w1_cap}),
+    )
+    weight = torch.empty(8, 8)
+    if w1_cap == 0:
+        assert prefetch._start_prefetch(weight, torch.randn(1, 8), 1.0, window=WEIGHT_PREFETCH_WINDOW_ATTN_O) is None
+    joins = []
+    monkeypatch.setattr(prefetch, "_finish_prefetch", lambda stream: joins.append(stream))
+    monkeypatch.setattr(prefetch, "prefetch_stream", lambda: "stream")
+    prefetch.attention_gate_with_prefetch(torch.randn(1, 8), torch.randn(1, 8), weight, 1.0)
+    assert len(joins) == expected_joins
 
 
 def row_projection(prefix, **kwargs):

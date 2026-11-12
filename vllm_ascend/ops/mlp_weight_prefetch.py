@@ -13,6 +13,13 @@ import torch_npu
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from vllm_ascend.ascend_config import (
+    WEIGHT_PREFETCH_WINDOW_ATTN_O,
+    WEIGHT_PREFETCH_WINDOW_MLP_DOWN,
+    WEIGHT_PREFETCH_WINDOW_MLP_GATE_UP,
+    WEIGHT_PREFETCH_WINDOW_NEXT_QKV,
+    max_prefetch_weight_size_bytes,
+)
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.gemma_norm_weight import gemma_norm_weight
 from vllm_ascend.ops.weight_prefetch import MAX_PREFETCH_WEIGHT_SIZE, layer_idx_from_prefix, layers_of_model_instance
@@ -22,6 +29,28 @@ MLP_PREFETCH_TOKEN_THRESHOLD = 500
 # This tree has no allreduce_rmsnorm_fusion_pass module; only the constant
 # is needed. 512 matches the reference tree's definition.
 ALLREDUCE_NORM_FUSE_THRESHOLD = 512
+
+DEFAULT_WINDOW_CAP_BYTES = max_prefetch_weight_size_bytes(None)
+
+
+def _all_reduce_prefetch_window(reduce_first: bool) -> str:
+    """W4 is issued after the down_proj collective, W2 before it."""
+    return WEIGHT_PREFETCH_WINDOW_NEXT_QKV if reduce_first else WEIGHT_PREFETCH_WINDOW_MLP_GATE_UP
+
+
+def _window_cap_bytes(window: str | None) -> int | None:
+    """Byte budget for one window; ``None`` means prefetch the whole weight.
+
+    ``window is None`` keeps the legacy single global cap for callers that do
+    not belong to the four dense-decode windows.
+    """
+    if window is None:
+        return MAX_PREFETCH_WEIGHT_SIZE
+    method = get_weight_prefetch_method()
+    caps = getattr(method, "max_prefetch_weight_size_bytes", None)
+    if not caps or window not in caps:
+        caps = DEFAULT_WINDOW_CAP_BYTES
+    return caps[window]
 
 
 def _uses_all_reduce_prefetch(projection):
@@ -133,7 +162,8 @@ def all_reduce_with_weight_prefetch(
     evaluates the gate with its actual shape. Returning the reduction puts
     the op on the real data path; no unused side-effect-only node is needed.
     """
-    size = _prefetch_size(weight, ratio)
+    window = _all_reduce_prefetch_window(reduce_first)
+    size = _prefetch_size(weight, ratio, window)
     if size <= 0 or not 0 < output.shape[0] < MLP_PREFETCH_TOKEN_THRESHOLD:
         return tensor_model_parallel_all_reduce(output)
 
@@ -147,7 +177,7 @@ def all_reduce_with_weight_prefetch(
         with npu_stream_switch(stream):
             torch_npu.npu_prefetch(weight, None, size, 0)
     else:
-        stream = _start_prefetch(weight, output, ratio)
+        stream = _start_prefetch(weight, output, ratio, window=window)
         output = tensor_model_parallel_all_reduce(output)
     _finish_prefetch(stream)
     return output
@@ -159,14 +189,24 @@ def _all_reduce_with_weight_prefetch_fake(
     return torch.empty_like(output)
 
 
-def _prefetch_size(weight: torch.Tensor, ratio: float) -> int:
-    return min(int(weight.numel() * weight.element_size() * ratio), MAX_PREFETCH_WEIGHT_SIZE)
+def _prefetch_size(weight: torch.Tensor, ratio: float, window: str | None = None) -> int:
+    weight_bytes = max(0, int(weight.numel() * weight.element_size() * ratio))
+    cap = _window_cap_bytes(window)
+    if cap is None:
+        return weight_bytes
+    return min(weight_bytes, cap)
 
 
-def _start_prefetch(weight: torch.Tensor, dependency: torch.Tensor, ratio: float, num_tokens: int | None = None):
+def _start_prefetch(
+    weight: torch.Tensor,
+    dependency: torch.Tensor,
+    ratio: float,
+    num_tokens: int | None = None,
+    window: str | None = None,
+):
     # Decide inside the op: profile_run may trace at a prefill size while
     # ACL graphs are subsequently captured at smaller decode sizes.
-    size = _prefetch_size(weight, ratio)
+    size = _prefetch_size(weight, ratio, window)
     tokens = dependency.shape[0] if num_tokens is None else num_tokens
     if size <= 0 or not 0 < tokens < MLP_PREFETCH_TOKEN_THRESHOLD:
         return None
@@ -200,7 +240,11 @@ def prefetch_gemma_rms_norm(
         and 0 < x.shape[0] < MLP_PREFETCH_TOKEN_THRESHOLD
         and _attention_gate_up_target(attention_prefix) is not None
     )
-    stream = None if prefetched else _start_prefetch(weight, x, ratio)
+    stream = (
+        None
+        if prefetched
+        else _start_prefetch(weight, x, ratio, window=WEIGHT_PREFETCH_WINDOW_MLP_GATE_UP)
+    )
     scale = norm_weight if effective_norm_weight else 1.0 + norm_weight
     if enable_custom_op():
         output, _, residual_out = torch.ops._C_ascend.npu_add_rms_norm_bias(x, residual, scale, None, epsilon)
@@ -224,7 +268,7 @@ def _prefetch_gemma_rms_norm_fake(
 
 
 def prefetch_swiglu(x: torch.Tensor, weight: torch.Tensor, ratio: float) -> torch.Tensor:
-    stream = _start_prefetch(weight, x, ratio)
+    stream = _start_prefetch(weight, x, ratio, window=WEIGHT_PREFETCH_WINDOW_MLP_DOWN)
     output = torch_npu.npu_swiglu(x)
     _finish_prefetch(stream)
     return output
@@ -242,7 +286,10 @@ def attention_gate_with_prefetch(
     the compiled graph. The guard must match the issue site's.
     """
     output = attn_output * torch.sigmoid(gate)
-    if _prefetch_size(weight, ratio) > 0 and 0 < attn_output.shape[0] < MLP_PREFETCH_TOKEN_THRESHOLD:
+    if (
+        _prefetch_size(weight, ratio, WEIGHT_PREFETCH_WINDOW_ATTN_O) > 0
+        and 0 < attn_output.shape[0] < MLP_PREFETCH_TOKEN_THRESHOLD
+    ):
         _finish_prefetch(prefetch_stream())
     return output
 
@@ -276,7 +323,7 @@ def prefetch_gated_norm(
     )
     if (
         ratio > 0
-        and weight.numel() * weight.element_size() * ratio >= 1
+        and _prefetch_size(weight, ratio, WEIGHT_PREFETCH_WINDOW_ATTN_O) > 0
         and 0 < num_tokens < MLP_PREFETCH_TOKEN_THRESHOLD
     ):
         _finish_prefetch(prefetch_stream())

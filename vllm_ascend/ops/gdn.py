@@ -555,12 +555,18 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         """
         # Launch inside the existing mutating core custom op so compilation
         # cannot discard or move this fork past the core computation.
-        from vllm_ascend.ops.mlp_weight_prefetch import _start_prefetch
+        from vllm_ascend.ops.mlp_weight_prefetch import WEIGHT_PREFETCH_WINDOW_ATTN_O, _start_prefetch
 
         method = get_weight_prefetch_method()
         ratio = float(method.attn.prefetch_ratio.get("o", 0)) if method is not None and method.attn.enable else 0.0
         if ratio > 0:
-            _start_prefetch(self.out_proj.weight, mixed_qkv, ratio, num_tokens=mixed_qkv.shape[0])
+            _start_prefetch(
+                self.out_proj.weight,
+                mixed_qkv,
+                ratio,
+                num_tokens=mixed_qkv.shape[0],
+                window=WEIGHT_PREFETCH_WINDOW_ATTN_O,
+            )
 
         forward_context = get_forward_context()
         attn_metadata: AttentionMetadata = forward_context.attn_metadata

@@ -5,7 +5,7 @@ import torch_npu
 from vllm.config import get_current_vllm_config
 from vllm.forward_context import ForwardContext, get_forward_context
 
-from vllm_ascend.ascend_config import WeightPrefetchConfig
+from vllm_ascend.ascend_config import WeightPrefetchConfig, max_prefetch_weight_size_bytes
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.linear import AscendQKVParallelLinear, AscendRowParallelLinear
 from vllm_ascend.utils import get_inner_model, is_moe_model
@@ -66,6 +66,9 @@ class WeightPrefetchMethod:
     def __init__(self, weight_prefetch_config: WeightPrefetchConfig) -> None:
         self.is_moe = is_moe_model(get_current_vllm_config())
         self.mla_sfa_prefetch_enable = weight_prefetch_config.enabled
+        self.max_prefetch_weight_size_bytes: dict[str, int | None] = max_prefetch_weight_size_bytes(
+            getattr(weight_prefetch_config, "max_prefetch_weight_size_mb", None)
+        )
 
         self.attn = ModuleWeightPrefetchConfig(
             module_name="attn",

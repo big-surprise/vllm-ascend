@@ -80,8 +80,39 @@ The following table lists additional configuration options available in vLLM Asc
 | `multistream_dsv4_dsa_overlap`      | bool | `True`  | Whether to enable dsa multi-stream overlap for DeepSeek V4.  |
 | `rl_config`                        | dict | `{}`    | One-click RL mode configuration. See <a href="#rl_config">rl_config</a> for all fields, the two deployment modes, usage examples, and the migration guide. |
 | `combine_quant_mode`                | int  | `0`     | Fused MC2 configuration. This configuration will be passed as the `comm_quant_mode` argument for the `torch_npu.npu_moe_distribute_combine_v2` operator. Please refer to the operator documentation for the valid value range. |
+| `weight_prefetch_config`            | dict | `{"enabled": false}` | Decode weight prefetch settings, including per-window size budgets. See <a href="#weight_prefetch_config">weight_prefetch_config</a>. |
 
 The details of each configuration option are as follows:
+
+**weight_prefetch_config**
+
+Decode-only weight prefetch forks a fetch inside one compute window and joins it immediately before the MatMul that consumes the weight. This nested dict controls the byte budget of each window. It takes effect when `enabled` is `true`; the per-window budgets below apply to the dense (non-MoE) path used by Qwen3.5 on Ascend 950PR.
+
+| Name | Type | Default | Description |
+| ---- | ---- | ------- | ----------- |
+| `enabled` | bool | `false` | Enable weight prefetch. |
+| `prefetch_ratio` | dict | `{"attn": {"qkv": 1.0, "o": 1.0}, "moe": {"gate_up": 0.8}, "mlp": {"gate_up": 1.0, "down": 1.0}}` | Fraction of each weight to prefetch. |
+| `max_prefetch_weight_size_mb` | dict | see the table below | Per-window prefetch budget in MiB. Omitted windows keep their default. |
+
+`max_prefetch_weight_size_mb` accepts four window keys:
+
+| Window | Default | Fork point | Description |
+| ------ | ------- | ---------- | ----------- |
+| `attn_o_proj` | `null` | W1, QKV split / GDN core | This layer's `o_proj` or GDN `out_proj`. `null` prefetches the whole weight. |
+| `mlp_gate_up` | `22` | W2, attention AllReduce | This layer's `mlp.gate_up_proj`. |
+| `mlp_down` | `8` | W3, SwiGLU | This layer's `mlp.down_proj`. The SwiGLU window is short, so a large fetch here extends the fence and can increase TPOT. |
+| `next_qkv` | `null` | W4, MLP AllReduce | Next layer's `in_proj_qkv` / `in_proj_qkvz` / `qkv_proj`. `null` prefetches the whole weight. |
+
+A value of `null` prefetches the whole weight (still multiplied by `prefetch_ratio`), `0` disables that window, and a positive number caps the prefetch at that many MiB. Unknown window names, negative values, and non-numeric values are rejected at startup. The legacy MoE / non-Qwen3.5 prefetch path is unaffected: it keeps its single global `MAX_PREFETCH_WEIGHT_SIZE` cap. Sizes are resolved inside custom ops, so they are frozen when an ACL graph is captured; restart the server after changing them.
+
+Example: keep W1/W4 full, raise W2 and switch off W3:
+
+```bash
+vllm serve Qwen/Qwen3.5-27B \
+  --additional-config='{"weight_prefetch_config":{"enabled":true,"max_prefetch_weight_size_mb":{"mlp_gate_up":28,"mlp_down":0}}}'
+```
+
+For BF16 TP4 at single-digit concurrency, W1/W4 have tens of microseconds of idle MTE2 bandwidth and benefit from full coverage, W2 is worth sweeping in the 24-32 MiB range, and W3 should be swept in 0-12 MiB because SwiGLU leaves little room. Compare P90 TPOT after each change.
 
 **xlite_graph_config**
 

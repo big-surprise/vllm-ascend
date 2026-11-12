@@ -371,9 +371,15 @@ def triton_split_qkv_rmsnorm_mrope(
         # window from here to o_proj's MatMul (FIAS + gate) measured 43.4us at
         # only 33% MTE2 occupancy on decode, so unlike the MLP MatMuls it has
         # real spare bandwidth. attention_gate_with_prefetch() joins it.
-        from vllm_ascend.ops.mlp_weight_prefetch import _start_prefetch
+        from vllm_ascend.ops.mlp_weight_prefetch import WEIGHT_PREFETCH_WINDOW_ATTN_O, _start_prefetch
 
-        _start_prefetch(o_proj_weight, qkv, o_proj_ratio, num_tokens=num_tokens)
+        _start_prefetch(
+            o_proj_weight,
+            qkv,
+            o_proj_ratio,
+            num_tokens=num_tokens,
+            window=WEIGHT_PREFETCH_WINDOW_ATTN_O,
+        )
 
     return q_output, k_output, v_output, gate_output
 

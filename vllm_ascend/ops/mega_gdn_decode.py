@@ -275,12 +275,17 @@ def ascend_gdn_core_with_norm(
     ratio = float(method.attn.prefetch_ratio.get("o", 0)) if method is not None and method.attn.enable else 0.0
     if fused:
         # The usual gated-norm op owns this join; mega already did the norm.
-        from vllm_ascend.ops.mlp_weight_prefetch import MLP_PREFETCH_TOKEN_THRESHOLD, _finish_prefetch, _prefetch_size
+        from vllm_ascend.ops.mlp_weight_prefetch import (
+            MLP_PREFETCH_TOKEN_THRESHOLD,
+            WEIGHT_PREFETCH_WINDOW_ATTN_O,
+            _finish_prefetch,
+            _prefetch_size,
+        )
         from vllm_ascend.utils import prefetch_stream
 
         if (
             ratio > 0
-            and _prefetch_size(layer.out_proj.weight, ratio) > 0
+            and _prefetch_size(layer.out_proj.weight, ratio, WEIGHT_PREFETCH_WINDOW_ATTN_O) > 0
             and 0 < qkv.shape[0] < MLP_PREFETCH_TOKEN_THRESHOLD
         ):
             _finish_prefetch(prefetch_stream())

@@ -1528,6 +1528,74 @@ class XliteGraphConfig:
                 vllm_config.cache_config.block_size,
             )
 
+# Weight prefetch windows of the dense (non-MoE) decode path. A window is the
+# idle interval between forking a weight fetch and the MatMul that consumes it.
+WEIGHT_PREFETCH_WINDOW_ATTN_O = "attn_o_proj"
+WEIGHT_PREFETCH_WINDOW_MLP_GATE_UP = "mlp_gate_up"
+WEIGHT_PREFETCH_WINDOW_MLP_DOWN = "mlp_down"
+WEIGHT_PREFETCH_WINDOW_NEXT_QKV = "next_qkv"
+WEIGHT_PREFETCH_WINDOWS = frozenset(
+    {
+        WEIGHT_PREFETCH_WINDOW_ATTN_O,
+        WEIGHT_PREFETCH_WINDOW_MLP_GATE_UP,
+        WEIGHT_PREFETCH_WINDOW_MLP_DOWN,
+        WEIGHT_PREFETCH_WINDOW_NEXT_QKV,
+    }
+)
+
+# Per-window prefetch budget in MiB. ``None`` prefetches the whole weight and
+# ``0`` disables the window. W1/W4 idle windows have enough spare MTE2
+# bandwidth to cover a full projection, while W3's short SwiGLU window must
+# stay bounded or the fence extends past the consumer.
+DEFAULT_MAX_PREFETCH_WEIGHT_SIZE_MB: dict[str, int | float | None] = {
+    WEIGHT_PREFETCH_WINDOW_ATTN_O: None,
+    # 22 MiB matches the legacy MAX_PREFETCH_WEIGHT_SIZE cap.
+    WEIGHT_PREFETCH_WINDOW_MLP_GATE_UP: 22,
+    WEIGHT_PREFETCH_WINDOW_MLP_DOWN: 8,
+    WEIGHT_PREFETCH_WINDOW_NEXT_QKV: None,
+}
+MIB_IN_BYTES = 1024 * 1024
+
+
+def normalize_max_prefetch_weight_size_mb(raw: Any) -> dict[str, int | float | None]:
+    """Validate the per-window MiB config and fill in omitted windows."""
+    if raw is None:
+        return dict(DEFAULT_MAX_PREFETCH_WEIGHT_SIZE_MB)
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "additional_config.weight_prefetch_config.max_prefetch_weight_size_mb must be a dict, "
+            f"got {type(raw).__name__}."
+        )
+    sizes = dict(DEFAULT_MAX_PREFETCH_WEIGHT_SIZE_MB)
+    for window, size_mb in raw.items():
+        if window not in WEIGHT_PREFETCH_WINDOWS:
+            raise ValueError(
+                f"Unknown weight prefetch window {window!r}; expected one of {sorted(WEIGHT_PREFETCH_WINDOWS)}."
+            )
+        if size_mb is None:
+            sizes[window] = None
+            continue
+        if isinstance(size_mb, bool) or not isinstance(size_mb, (int, float)) or not math.isfinite(size_mb):
+            raise ValueError(
+                f"max_prefetch_weight_size_mb[{window!r}] must be null or a non-negative number, got {size_mb!r}."
+            )
+        if size_mb < 0:
+            raise ValueError(f"max_prefetch_weight_size_mb[{window!r}] must be non-negative, got {size_mb!r}.")
+        sizes[window] = float(size_mb)
+    return sizes
+
+
+def max_prefetch_weight_size_bytes(size_mb: dict[str, int | float | None] | None) -> dict[str, int | None]:
+    """Convert the MiB config into byte caps once, off the decode hot path."""
+    caps = {
+        window: None if mb is None else int(float(mb) * MIB_IN_BYTES)
+        for window, mb in DEFAULT_MAX_PREFETCH_WEIGHT_SIZE_MB.items()
+    }
+    for window, mb in (size_mb or {}).items():
+        caps[window] = None if mb is None else int(float(mb) * MIB_IN_BYTES)
+    return caps
+
+
 class WeightPrefetchConfig:
     """Configuration Object for weight_prefetch_config from additional_config"""
 
@@ -1536,10 +1604,14 @@ class WeightPrefetchConfig:
         "moe": {"gate_up": 0.8},
         "mlp": {"gate_up": 1.0, "down": 1.0},
     }
+    max_prefetch_weight_size_mb: dict = DEFAULT_MAX_PREFETCH_WEIGHT_SIZE_MB
 
     def __init__(self, weight_prefetch_config: dict):
         self.enabled = weight_prefetch_config.get("enabled", False)
         self.prefetch_ratio = weight_prefetch_config.get("prefetch_ratio", self.prefetch_ratio)
+        self.max_prefetch_weight_size_mb = normalize_max_prefetch_weight_size_mb(
+            weight_prefetch_config.get("max_prefetch_weight_size_mb")
+        )
 
 @config
 class ProfilingChunkConfig:
