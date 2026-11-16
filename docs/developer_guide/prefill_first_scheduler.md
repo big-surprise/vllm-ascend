@@ -1,9 +1,10 @@
 # Prefill-first scheduling
 
-This opt-in scheduler follows SGLang's ordinary prefill-first selection: try a
-prefill batch first, then run decode if no prefill compute can be admitted. It
-does not fill a prefill batch's unused token budget with decode requests and does
-not impose a fixed prefill/decode alternation.
+This opt-in scheduler uses SGLang-inspired prefill-first selection with decode
+waiting protection. It does not fill a prefill batch's unused token budget with
+decode requests. Once an existing decode has been deferred by one successful
+prefill batch, the next step tries a pure decode batch first. This protection is
+an addition to the ordinary strict prefill-first policy.
 
 ## Enable
 
@@ -29,11 +30,20 @@ class; verify the initialization log when enabling a policy.
 
 ## Scheduling behavior
 
-Each scheduling step first traverses running requests and then waiting requests
-for prefill work. If no compute tokens were scheduled, it repeats that traversal
-for decode work. Allocation, preemption, request-slot limits, encoder constraints
-and KV dependencies still apply. A waiting queue that cannot be admitted does not
-prevent existing decodes from progressing.
+Each scheduling step traverses running requests and then waiting requests for
+the preferred phase. Normally this is prefill; if a pending decode has already
+waited through one prefill batch, it is decode. If no compute tokens were
+scheduled, the scheduler tries the other phase in the same step. Allocation,
+preemption, request-slot limits, encoder constraints and KV dependencies still
+apply. A blocked preferred phase therefore does not force an idle step.
+
+`MAX_PREFILL_BATCHES_WITH_WAITING_DECODE = 1` controls this initial protection
+limit. Only a successful prefill with pending decode work consumes the limit;
+the initial prefill before any decode is waiting does not. A successful decode
+resets the count; idle/paused steps preserve it. With both phases continuously
+available the result is `P, D, P, D, ...`. With only prefill available, chunks
+continue immediately. This is a phase-level scheduling bound, not a millisecond
+deadline or a guarantee for requests blocked on resources or dependencies.
 
 The phase is determined after prefix-cache matching, token caps and Mamba block
 alignment. More than one input token, or a first input token with no previous
@@ -67,8 +77,9 @@ logs contain `PrefillFirst batch=... requests=... tokens=...`. Backend metadata
 should also be sampled when measuring actual GDN mixed-batch frequency. Keep
 logging settings identical between compared runs and avoid per-layer logging.
 
-Strict prefill preference can delay decode under sustained arrivals. A prefill
-chunk can be long even when only one prefill batch is executed. Compare TTFT,
+Decode waiting protection prevents an unlimited sequence of newly preferred
+prefills while runnable decode work is waiting. A prefill chunk can still be long
+even when only one prefill batch is executed. Compare TTFT,
 TPOT, end-to-end latency, throughput and cache hit rate at identical request-rate
 and concurrency settings. Pure decode batches larger than 32 still fall back
 from the current MegaGDN implementation; this scheduler does not change that

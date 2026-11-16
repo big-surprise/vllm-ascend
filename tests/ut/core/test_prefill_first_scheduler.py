@@ -98,29 +98,42 @@ def test_new_prefill_wins_without_advancing_or_freeing_decode(scheduler_cls, use
     assert scheduler.phase_batch_counts == {"prefill": 2, "decode": 1, "idle": 0}
 
 
-def test_chunked_prefill_continues_without_decode_fill(scheduler_cls):
+def test_chunked_prefill_remains_pure_and_yields_to_waiting_decode(scheduler_cls):
     scheduler = make_scheduler(scheduler_cls)
     decode = start_decode(scheduler, req(1))
     prefill = req(2, length=20)
     scheduler.add_request(prefill)
-    for chunk_size in (8, 8, 4):
+    for index, chunk_size in enumerate((8, 8, 4)):
         output = scheduler.schedule()
         assert output.num_scheduled_tokens == {prefill.request_id: chunk_size}
-        assert decode.num_computed_tokens == 4
+        assert decode.num_computed_tokens == 4 + index
         consume(scheduler, output)
+        if index < 2:
+            decode_output = scheduler.schedule()
+            assert decode_output.num_scheduled_tokens == {decode.request_id: 1}
+            consume(scheduler, decode_output)
     assert scheduler.schedule().num_scheduled_tokens == {decode.request_id: 1, prefill.request_id: 1}
 
 
-def test_continuous_new_prefills_are_not_forced_to_alternate(scheduler_cls):
+def test_continuous_arrivals_cannot_indefinitely_defer_running_decode(scheduler_cls):
     scheduler = make_scheduler(scheduler_cls)
     decode = start_decode(scheduler, req(1))
+    scheduler.add_request(req(2))
     for i in range(2, 5):
-        prefill = req(i)
-        scheduler.add_request(prefill)
+        prefill_id = f"id-{i}"
         output = scheduler.schedule()
-        assert output.num_scheduled_tokens == {prefill.request_id: 4}
+        assert output.num_scheduled_tokens == {prefill_id: 4}
         consume(scheduler, output)
-    assert decode.num_computed_tokens == 4
+        waiting = req(i + 1)
+        scheduler.add_request(waiting)
+        output = scheduler.schedule()
+        assert decode.request_id in output.num_scheduled_tokens
+        assert waiting.request_id not in output.num_scheduled_tokens
+        assert set(output.num_scheduled_tokens.values()) == {1}
+        assert waiting.status == RequestStatus.WAITING
+        consume(scheduler, output)
+    assert decode.num_computed_tokens == 7
+    assert scheduler.phase_batch_counts == {"prefill": 4, "decode": 3, "idle": 0}
 
 
 def test_full_running_slots_fall_back_to_decode(scheduler_cls):
@@ -336,12 +349,16 @@ def test_hybrid_mamba_alignment_preserves_pure_batches_and_output_metadata(sched
     prefill = req(2, length=12)
     scheduler.add_request(prefill)
     assert scheduler.need_mamba_block_aligned_split
-    for _ in range(3):
+    for index in range(3):
         output = scheduler.schedule()
         assert output.num_scheduled_tokens == {prefill.request_id: 4}
-        assert decode.num_computed_tokens == 4
+        assert decode.num_computed_tokens == 4 + index
         assert output.kv_connector_block_state is None
         consume(scheduler, output)
+        if index < 2:
+            decode_output = scheduler.schedule()
+            assert decode_output.num_scheduled_tokens == {decode.request_id: 1}
+            consume(scheduler, decode_output)
     output = scheduler.schedule()
     assert output.num_scheduled_tokens == {decode.request_id: 1, prefill.request_id: 1}
     consume(scheduler, output)
@@ -351,6 +368,67 @@ def test_scheduler_class_option_resolves_the_async_implementation():
     config = make_dyntra_test_config()
     config.scheduler_config.scheduler_cls = "vllm_ascend.core.prefill_first_scheduler.PrefillFirstAsyncScheduler"
     assert config.scheduler_config.get_scheduler_cls() is PrefillFirstAsyncScheduler
+
+
+def test_prefill_only_chunks_continue_without_idle_decode_steps(scheduler_cls):
+    scheduler = make_scheduler(scheduler_cls)
+    prefill = req(1, length=20)
+    scheduler.add_request(prefill)
+    for size in (8, 8, 4):
+        output = scheduler.schedule()
+        assert output.num_scheduled_tokens == {prefill.request_id: size}
+        consume(scheduler, output)
+    assert scheduler.phase_batch_counts == {"prefill": 3, "decode": 0, "idle": 0}
+
+
+def test_decode_is_protected_when_earlier_prefill_exhausts_entire_budget(scheduler_cls):
+    scheduler = make_scheduler(scheduler_cls)
+    scheduler.scheduler_config.long_prefill_token_threshold = 4
+    prefill, decode = req(1, length=20), req(2, length=4)
+    scheduler.add_request(prefill)
+    scheduler.add_request(decode)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {prefill.request_id: 4, decode.request_id: 4}
+    consume(scheduler, output)
+    scheduler.scheduler_config.long_prefill_token_threshold = 0
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {prefill.request_id: 8}
+    consume(scheduler, output)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {decode.request_id: 1}
+    consume(scheduler, output)
+
+
+def test_blocked_protected_decode_falls_back_to_prefill_without_idling(scheduler_cls):
+    scheduler = make_scheduler(scheduler_cls)
+    start_decode(scheduler, req(1))
+    prefill = req(2)
+    scheduler.add_request(prefill)
+    consume(scheduler, scheduler.schedule())
+    for running in scheduler.running:
+        running.next_decode_eligible_step = scheduler.current_step + 100
+    fresh = req(3, length=6)
+    scheduler.add_request(fresh)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {fresh.request_id: 6}
+    consume(scheduler, output)
+    assert scheduler.phase_batch_counts["idle"] == 0
+
+
+def test_pause_does_not_cancel_decode_protection(scheduler_cls):
+    scheduler = make_scheduler(scheduler_cls)
+    decode = start_decode(scheduler, req(1))
+    scheduler.add_request(req(2))
+    consume(scheduler, scheduler.schedule())
+    waiting = req(3)
+    scheduler.add_request(waiting)
+    scheduler._pause_state = PauseState.PAUSED_ALL
+    assert not scheduler.schedule().num_scheduled_tokens
+    scheduler._pause_state = PauseState.UNPAUSED
+    output = scheduler.schedule()
+    assert decode.request_id in output.num_scheduled_tokens
+    assert waiting.request_id not in output.num_scheduled_tokens
+    assert set(output.num_scheduled_tokens.values()) == {1}
 
 
 @pytest.mark.parametrize("setting", ["speculation", "dp", "pp"])

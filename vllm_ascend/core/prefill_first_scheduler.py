@@ -24,10 +24,11 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+MAX_PREFILL_BATCHES_WITH_WAITING_DECODE = 1
 
 
 class PrefillFirstScheduler(Scheduler):
-    """Prefer a pure prefill batch; run pure decode when no prefill fits.
+    """Prefer pure prefill, with a bounded number of decode deferrals.
 
     The initial supported scope is non-speculative autoregressive serving with
     DP=1 and PP=1. Tensor parallelism, prefix caching, chunked prefill and
@@ -42,7 +43,18 @@ class PrefillFirstScheduler(Scheduler):
             raise ValueError("PrefillFirstScheduler currently requires DP=1 and PP=1")
         super().__init__(vllm_config, *args, **kwargs)
         self.phase_batch_counts = {"prefill": 0, "decode": 0, "idle": 0}
-        logger.info("PrefillFirstScheduler enabled: prefill-first, no mixed prefill/decode batches")
+        self._decode_waiting_prefill_batches = 0
+        logger.info(
+            "PrefillFirstScheduler enabled: no mixed batches, at most %d prefill batches while decode waits",
+            MAX_PREFILL_BATCHES_WITH_WAITING_DECODE,
+        )
+
+    @staticmethod
+    def _has_pending_decode(request: Request) -> bool:
+        # This is candidate detection; the scheduling pass still checks actual
+        # readiness, token limits and KV allocation before committing work.
+        pending = request.num_tokens_with_spec + request.num_output_placeholders - request.num_computed_tokens
+        return request.num_computed_tokens > 0 and pending == 1
 
     @staticmethod
     def _is_prefill_work(num_computed_tokens: int, num_new_tokens: int) -> bool:
@@ -91,9 +103,16 @@ class PrefillFirstScheduler(Scheduler):
             throttle_prefills and not self.prefill_capacity_bound
         ) and any(not r.is_prefill_chunk for r in self.running)
 
-        # SGLang-style phase selection: prefer runnable prefill work,
-        # otherwise fall back to decode. Finalize state exactly once.
-        for prefill_phase in (True, False):
+        # Scan before consuming the budget: an early prefill can exhaust
+        # it before the running loop ever visits a waiting decode.
+        decode_waiting = any(self._has_pending_decode(request) for request in self.running)
+        protect_decode = (
+            self._decode_waiting_prefill_batches >= MAX_PREFILL_BATCHES_WITH_WAITING_DECODE
+        )
+        phase_order = (False, True) if protect_decode else (True, False)
+        # A blocked preferred phase falls through to the other phase;
+        # neither branch returns a preventable empty scheduling step.
+        for prefill_phase in phase_order:
             # First, schedule the RUNNING requests.
             req_index = 0
             while req_index < len(self.running) and token_budget > 0:
@@ -210,7 +229,10 @@ class PrefillFirstScheduler(Scheduler):
                     req_index += 1
                     continue
 
-                if self._is_prefill_work(request.num_computed_tokens, num_new_tokens) != prefill_phase:
+                request_is_prefill = self._is_prefill_work(request.num_computed_tokens, num_new_tokens)
+                if request_is_prefill != prefill_phase:
+                    if not request_is_prefill:
+                        decode_waiting = True
                     req_index += 1
                     continue
 
@@ -618,10 +640,14 @@ class PrefillFirstScheduler(Scheduler):
 
                     # Classify after cache hits, chunk caps and Mamba alignment.
                     # An existing state plus one token uses the decode kernel path.
-                    if num_new_tokens and self._is_prefill_work(num_computed_tokens, num_new_tokens) != prefill_phase:
-                        request_queue.pop_request()
-                        step_skipped_waiting.prepend_request(request)
-                        continue
+                    if num_new_tokens:
+                        request_is_prefill = self._is_prefill_work(num_computed_tokens, num_new_tokens)
+                        if request_is_prefill != prefill_phase:
+                            if not request_is_prefill:
+                                decode_waiting = True
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
 
                     # During async KV load, no forward pass is run yet.
                     # Allocate speculative lookahead slots later to avoid
@@ -953,11 +979,19 @@ class PrefillFirstScheduler(Scheduler):
         if not num_scheduled_tokens:
             batch_kind = "idle"
         self.phase_batch_counts[batch_kind] += 1
+        if batch_kind == "decode":
+            self._decode_waiting_prefill_batches = 0
+        elif batch_kind == "prefill":
+            self._decode_waiting_prefill_batches = (
+                self._decode_waiting_prefill_batches + 1 if decode_waiting else 0
+            )
+        # Idle/paused steps must not erase an existing decode's protection.
         logger.debug(
-            "PrefillFirst batch=%s requests=%d tokens=%d",
+            "PrefillFirst batch=%s requests=%d tokens=%d decode_deferred_prefills=%d",
             batch_kind,
             len(num_scheduled_tokens),
             total_num_scheduled_tokens,
+            self._decode_waiting_prefill_batches,
         )
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
