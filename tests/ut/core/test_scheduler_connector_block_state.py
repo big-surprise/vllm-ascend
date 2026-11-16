@@ -9,13 +9,21 @@ import pytest
 
 from tests.ut.core.test_dyntra_lb_scheduler import create_dyntra_lb_scheduler, make_dyntra_test_config
 from vllm_ascend.core.dyntra_lb_scheduler import AsyncDyntraLBScheduler, DyntraLBScheduler
+from vllm_ascend.core.prefill_first_scheduler import PrefillFirstAsyncScheduler, PrefillFirstScheduler
 from vllm_ascend.core.scheduler_profiling_chunk import ProfilingChunkScheduler
 from vllm_ascend.patch.platform.patch_balance_schedule import BalanceScheduler
 
 
 @pytest.mark.parametrize(
     "scheduler_cls",
-    [DyntraLBScheduler, AsyncDyntraLBScheduler, BalanceScheduler, ProfilingChunkScheduler],
+    [
+        DyntraLBScheduler,
+        AsyncDyntraLBScheduler,
+        BalanceScheduler,
+        ProfilingChunkScheduler,
+        PrefillFirstScheduler,
+        PrefillFirstAsyncScheduler,
+    ],
 )
 @pytest.mark.parametrize("with_connector", [False, True])
 def test_boundary_state_is_drained_consumed_and_not_dispatched(monkeypatch, scheduler_cls, with_connector):
