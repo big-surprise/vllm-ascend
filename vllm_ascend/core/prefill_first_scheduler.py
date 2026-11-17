@@ -44,9 +44,32 @@ class PrefillFirstScheduler(Scheduler):
         super().__init__(vllm_config, *args, **kwargs)
         self.phase_batch_counts = {"prefill": 0, "decode": 0, "idle": 0}
         self._decode_waiting_prefill_batches = 0
+        self._log_policy()
+
+    def _log_policy(self) -> None:
         logger.info(
             "PrefillFirstScheduler enabled: no mixed batches, at most %d prefill batches while decode waits",
             MAX_PREFILL_BATCHES_WITH_WAITING_DECODE,
+        )
+
+    def _get_phase_order(self) -> tuple[bool | None, ...]:
+        protect_decode = self._decode_waiting_prefill_batches >= MAX_PREFILL_BATCHES_WITH_WAITING_DECODE
+        return (False, True) if protect_decode else (True, False)
+
+    def _record_phase(self, batch_kind: str, decode_waiting: bool, num_scheduled_tokens: dict[str, int]) -> None:
+        if batch_kind == "decode":
+            self._decode_waiting_prefill_batches = 0
+        elif batch_kind == "prefill":
+            self._decode_waiting_prefill_batches = (
+                self._decode_waiting_prefill_batches + 1 if decode_waiting else 0
+            )
+        # Idle/paused steps must not erase an existing decode's protection.
+        logger.debug(
+            "PrefillFirst batch=%s requests=%d tokens=%d decode_deferred_prefills=%d",
+            batch_kind,
+            len(num_scheduled_tokens),
+            sum(num_scheduled_tokens.values()),
+            self._decode_waiting_prefill_batches,
         )
 
     @staticmethod
@@ -106,10 +129,7 @@ class PrefillFirstScheduler(Scheduler):
         # Scan before consuming the budget: an early prefill can exhaust
         # it before the running loop ever visits a waiting decode.
         decode_waiting = any(self._has_pending_decode(request) for request in self.running)
-        protect_decode = (
-            self._decode_waiting_prefill_batches >= MAX_PREFILL_BATCHES_WITH_WAITING_DECODE
-        )
-        phase_order = (False, True) if protect_decode else (True, False)
+        phase_order = self._get_phase_order()
         # A blocked preferred phase falls through to the other phase;
         # neither branch returns a preventable empty scheduling step.
         for prefill_phase in phase_order:
@@ -230,7 +250,7 @@ class PrefillFirstScheduler(Scheduler):
                     continue
 
                 request_is_prefill = self._is_prefill_work(request.num_computed_tokens, num_new_tokens)
-                if request_is_prefill != prefill_phase:
+                if prefill_phase is not None and request_is_prefill != prefill_phase:
                     if not request_is_prefill:
                         decode_waiting = True
                     req_index += 1
@@ -642,7 +662,7 @@ class PrefillFirstScheduler(Scheduler):
                     # An existing state plus one token uses the decode kernel path.
                     if num_new_tokens:
                         request_is_prefill = self._is_prefill_work(num_computed_tokens, num_new_tokens)
-                        if request_is_prefill != prefill_phase:
+                        if prefill_phase is not None and request_is_prefill != prefill_phase:
                             if not request_is_prefill:
                                 decode_waiting = True
                             request_queue.pop_request()
@@ -975,24 +995,17 @@ class PrefillFirstScheduler(Scheduler):
         if self.defer_block_free and total_num_scheduled_tokens > 0:
             self.sched_step_seq += 1
 
-        batch_kind = "prefill" if prefill_phase else "decode"
-        if not num_scheduled_tokens:
-            batch_kind = "idle"
-        self.phase_batch_counts[batch_kind] += 1
-        if batch_kind == "decode":
-            self._decode_waiting_prefill_batches = 0
-        elif batch_kind == "prefill":
-            self._decode_waiting_prefill_batches = (
-                self._decode_waiting_prefill_batches + 1 if decode_waiting else 0
-            )
-        # Idle/paused steps must not erase an existing decode's protection.
-        logger.debug(
-            "PrefillFirst batch=%s requests=%d tokens=%d decode_deferred_prefills=%d",
-            batch_kind,
-            len(num_scheduled_tokens),
-            total_num_scheduled_tokens,
-            self._decode_waiting_prefill_batches,
+        phase_types = {
+            self._is_prefill_work(self.requests[req_id].num_computed_tokens, num_tokens)
+            for req_id, num_tokens in num_scheduled_tokens.items()
+        }
+        batch_kind = (
+            "mixed" if len(phase_types) == 2 else
+            "prefill" if True in phase_types else
+            "decode" if False in phase_types else "idle"
         )
+        self.phase_batch_counts[batch_kind] += 1
+        self._record_phase(batch_kind, decode_waiting, num_scheduled_tokens)
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output

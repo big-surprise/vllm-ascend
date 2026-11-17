@@ -36,6 +36,16 @@ def _strict_binary_env(name: str, default: str = "0") -> bool:
 
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # DecodePriorityScheduler: maximum successful pure-decode batches while
+    # prefill waits. Default 4; integer >= 0; 0 disables deliberate deferral.
+    # Read once at scheduler initialization. Not sensitive.
+    "VLLM_ASCEND_DECODE_BURST_STEPS": lambda: int(os.getenv("VLLM_ASCEND_DECODE_BURST_STEPS", "4")),
+    # DecodePriorityScheduler: stop deliberately deferring prefill after this
+    # many milliseconds since first observation / last scheduled progress.
+    # Default 20; finite float >= 0; 0 disables deliberate deferral. This is
+    # not a TTFT deadline and cannot override KV/dependency constraints.
+    # Read once at scheduler initialization. Not sensitive.
+    "VLLM_ASCEND_PREFILL_MAX_DELAY_MS": lambda: float(os.getenv("VLLM_ASCEND_PREFILL_MAX_DELAY_MS", "20")),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.

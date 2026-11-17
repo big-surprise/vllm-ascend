@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, MambaSpec
 from vllm.v1.outputs import ModelRunnerOutput
@@ -41,7 +42,7 @@ def make_scheduler(scheduler_cls, budget=8, max_seqs=8, num_blocks=256, use_v2=T
     config = make_dyntra_test_config(max_num_seqs=max_seqs, max_num_batched_tokens=64, block_size=BLOCK_SIZE)
     config.kv_transfer_config = None
     config.scheduler_config.max_num_batched_tokens = budget
-    config.scheduler_config.async_scheduling = scheduler_cls is PrefillFirstAsyncScheduler
+    config.scheduler_config.async_scheduling = issubclass(scheduler_cls, AsyncScheduler)
     scheduler = create_dyntra_lb_scheduler(config, scheduler_cls=scheduler_cls, num_blocks=num_blocks)
     scheduler.use_v2_model_runner = use_v2
     return scheduler

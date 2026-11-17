@@ -8,6 +8,7 @@ from unittest.mock import Mock
 import pytest
 
 from tests.ut.core.test_dyntra_lb_scheduler import create_dyntra_lb_scheduler, make_dyntra_test_config
+from vllm_ascend.core.decode_priority_scheduler import DecodePriorityAsyncScheduler, DecodePriorityScheduler
 from vllm_ascend.core.dyntra_lb_scheduler import AsyncDyntraLBScheduler, DyntraLBScheduler
 from vllm_ascend.core.prefill_first_scheduler import PrefillFirstAsyncScheduler, PrefillFirstScheduler
 from vllm_ascend.core.scheduler_profiling_chunk import ProfilingChunkScheduler
@@ -23,6 +24,8 @@ from vllm_ascend.patch.platform.patch_balance_schedule import BalanceScheduler
         ProfilingChunkScheduler,
         PrefillFirstScheduler,
         PrefillFirstAsyncScheduler,
+        DecodePriorityScheduler,
+        DecodePriorityAsyncScheduler,
     ],
 )
 @pytest.mark.parametrize("with_connector", [False, True])
