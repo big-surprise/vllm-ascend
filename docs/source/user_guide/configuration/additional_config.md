@@ -51,6 +51,7 @@ The following table lists additional configuration options available in vLLM Asc
 | `finegrained_tp_config`             | dict | `{}`    | Configuration options for fine-grained tensor parallelism. See [Fine-Grained Tensor Parallelism](../feature_guide/Fine_grained_TP.md). |
 | `ascend_compilation_config`         | dict | `{}`    | Configuration options for ascend compilation                                                              |
 | `ascend_warmup_config`              | dict | `{}`    | Configuration options for startup warmup that overlaps weight loading                                     |
+| `allreduce_outplace`                | bool | `False` | Issue model all-reduce as a direct `HcclAllReduce` with a fresh receive buffer. See [allreduce_outplace](#allreduce_outplace). |
 | `eplb_config`                       | dict | `{}`    | Runner-specific EPLB extensions. See [Expert Parallelism Load Balancer](../feature_guide/expert_parallelism_load_balancer.md). |
 | `scheduler_config`                  | dict | `{}`    | Configuration options for Ascend scheduler extensions, including balance scheduling, recompute scheduling, DyntraLB, ShortRequestFirst, and dynamic chunked pipeline parallel. |
 | `refresh`                           | bool | `false` | Whether to refresh global Ascend configuration content. This is usually used by rlhf or ut/e2e test case. |
@@ -118,6 +119,22 @@ Both warmups run on a background thread during weight loading. The worker waits 
 | ---- | ---- | ------- | ----------- |
 | `enable_early_kernel_warmup` | bool | `False` | Compile the rejection sampler, penalty, and RMS norm Triton warmup kernels while weights load, so the regular kernel warmup hits the Triton cache. |
 | `enable_early_nz_warmup` | bool | `False` | Pay the one-time lazy initialization of the first NZ format cast while weights load. Independent of the quantization scheme. |
+
+
+**allreduce_outplace**
+
+Issues ordinary model all-reduce as a direct `HcclAllReduce` call with a distinct receive buffer, borrowing the process group's communicator and collective stream instead of creating a second HCCL communicator. Disabled by default.
+
+The default path mutates the input tensor (`torch.distributed.all_reduce` in place). `allreduce_outplace` makes the collective genuinely out-of-place, which is what graph capture and `torch.compile` require: a captured in-place reduce keeps writing into the static input of the captured region, so a second replay starts from already-reduced data.
+
+Enable it with:
+
+```bash
+vllm serve <model> --tensor-parallel-size 2 \
+  --additional-config '{"allreduce_outplace": true}'
+```
+
+Supported inputs are contiguous FP16/BF16/FP32 tensors in a base ACL format (ND/NCHW). Anything else — other dtypes, non-contiguous views, NZ/Fractal formats — transparently falls back to the default path on a per-call basis, so enabling the option cannot break correctness on unusual shapes. It targets latency-bound messages (small hidden-size all-reduce), not bandwidth; it does not replace compression-based collectives for large payloads.
 
 **eplb_config**
 
