@@ -446,6 +446,7 @@ class AscendConfig:
             "enable_kv_nz": false,
             "enable_mc2_hierarchy_comm": false,
             "enable_dsa_cp": false,
+            "allreduce_outplace": false,
             "sfa_dcp_force_tmajor_restore": false,
             "enable_force_eplb": false,
             "enable_pcp_o_proj_weight_sharding": true,
@@ -600,6 +601,20 @@ class AscendConfig:
     enable_kv_nz: bool = False
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
     enable_dsa_cp: bool = False
+    # Route ordinary model all-reduce through a direct ``HcclAllReduce`` call
+    # that borrows the process group's communicator and collective stream and
+    # writes into a fresh receive buffer, instead of
+    # ``torch.distributed.all_reduce`` mutating its input. The default path is
+    # in place, which is unsafe inside a captured graph: replay rewrites the
+    # producer's static buffer. See
+    # ``device_communicators/hccl_outplace.py`` for the full rationale.
+    #
+    # Off by default. Falls back to the default path per call for tensors the
+    # fast path cannot handle (non-BF16/FP16/FP32, non-contiguous, NZ/Fractal
+    # formats), so enabling it cannot break correctness on unusual shapes.
+    #
+    #   --additional-config '{"allreduce_outplace": true}'
+    allreduce_outplace: bool = False
     sfa_dcp_force_tmajor_restore: bool = False
     enable_force_eplb: bool = False
     enable_pcp_o_proj_weight_sharding: bool = True

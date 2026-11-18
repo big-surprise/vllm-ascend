@@ -18,6 +18,7 @@
 import torch
 import torch.distributed as dist
 from vllm.distributed.device_communicators.base_device_communicator import DeviceCommunicatorBase
+from vllm.logger import logger
 
 
 class _NpuAll2AllManager:
@@ -60,3 +61,49 @@ class NPUCommunicator(DeviceCommunicatorBase):
         # FlashInfer PCIe IPC backend on NPU.
         self.fi_pcie_ipc_ar_comm = None
         self.all2all_manager = _NpuAll2AllManager()
+
+        # Out-of-place all-reduce fast path, opt-in via
+        # ``--additional-config '{"allreduce_outplace": true}'``.
+        # Borrows this group's communicator instead of creating one, so the
+        # collective stays in the same HCCL context as every other group
+        # collective and honours the no-mutation contract of the all-reduce op.
+        self.outplace_ar = None
+        if self.world_size > 1 and _outplace_allreduce_enabled():
+            from vllm_ascend.distributed.device_communicators.hccl_outplace import (
+                OutplaceHcclAllReduce,
+            )
+
+            self.outplace_ar = OutplaceHcclAllReduce.try_create(
+                group=self.device_group,
+                device=self.device,
+                # torch_npu maps this value to the local device with
+                # ``rank % device_count``. It therefore needs the global rank,
+                # not the rank within a TP/PP subgroup.
+                global_rank=self.global_rank,
+            )
+
+    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        # Per-call fallback: the fast path only covers contiguous base-format
+        # FP16/BF16/FP32 tensors, so unusual dtypes/layouts keep the default
+        # behaviour instead of failing the request.
+        if self.outplace_ar is not None and self.outplace_ar.supported(input_):
+            return self.outplace_ar.all_reduce(input_)
+        return super().all_reduce(input_)
+
+    def destroy(self) -> None:
+        if self.outplace_ar is not None:
+            self.outplace_ar.destroy()
+            self.outplace_ar = None
+        super().destroy()
+
+
+def _outplace_allreduce_enabled() -> bool:
+    """Read the switch defensively: the config may not be initialised yet."""
+    try:
+        from vllm_ascend.ascend_config import get_ascend_config
+
+        return bool(get_ascend_config().allreduce_outplace)
+    except Exception as exc:  # noqa: BLE001 - config unavailable means "off"
+        logger.warning_once("Out-of-place NPU all-reduce stays disabled: %s.", exc)
+        return False
+
