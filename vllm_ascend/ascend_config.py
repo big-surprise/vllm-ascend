@@ -624,6 +624,16 @@ class AscendConfig:
     # output at the cost of one extra matmul. Qwen3.5 only: the Qwen3-Next
     # interleaved layout stores qkvz as one tensor that cannot be split.
     enable_gdn_qkv_split: bool = False
+    # Fork the fused Qwen3.5 GDN ``in_proj_ba`` projection (plus its b/a
+    # split) onto one auxiliary NPU stream so it overlaps the qkv(z) input
+    # projection instead of running serially after it on the main stream.
+    # The module and weight layout are untouched - this is a pure scheduling
+    # change, bitwise-identical outputs. Compatible with enable_gdn_qkv_split
+    # (the gains stack); the interleaved Qwen3-Next layout keeps its fused
+    # serial path.
+    #
+    #   --additional-config '{"enable_gdn_ba_overlap_stream": true}'
+    enable_gdn_ba_overlap_stream: bool = False
     draft_window_size: int | None = None
     mix_placement: bool = False
     # When non-zero, force the MC2 combine stage's comm quant_mode to this

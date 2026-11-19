@@ -62,7 +62,7 @@ from vllm_ascend.ops.triton.fused_gdn_gating_l2norm import (
 )
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
 from vllm_ascend.ops.triton.mamba.state_index import gather_ssm_states, scatter_ssm_states_
-from vllm_ascend.utils import get_weight_prefetch_method
+from vllm_ascend.utils import get_weight_prefetch_method, npu_stream_switch
 
 logger = init_logger(__name__)
 
@@ -88,6 +88,90 @@ def _gate_norm_fusion_enabled() -> bool:
         )
         return False
     return True
+
+
+@lru_cache(maxsize=1)
+def _ba_overlap_stream_enabled() -> bool:
+    """Read the switch once; it cannot change within a process."""
+    from vllm_ascend.ascend_config import get_ascend_config
+
+    return get_ascend_config().enable_gdn_ba_overlap_stream
+
+
+# Auxiliary stream carrying the fused in_proj_ba (and its b/a split) while the
+# main stream computes the qkv(z) projection. Lazily created, one per process,
+# shared by every GDN layer: layers run back to back on the main stream, so
+# the fork/join events serialize their side-stream work. A SINGLE stream is
+# deliberate: ba is a tiny bandwidth-bound GEMV (aic_mac_ratio ~5%), so the
+# only overlap that pays is ba vs the ~15us qkv(z) matmul, and one stream
+# with one fork/join event pair mirrors ops/kimi_kda.py's BFG overlap - the
+# multi-stream shape already proven compatible with multi-stream ACL graph
+# capture.
+_GDN_BA_STREAM: torch.npu.Stream | None = None
+
+
+def _gdn_ba_side_stream() -> torch.npu.Stream:
+    global _GDN_BA_STREAM
+    if _GDN_BA_STREAM is None:
+        _GDN_BA_STREAM = torch_npu.npu.Stream()
+    return _GDN_BA_STREAM
+
+
+def _project_inputs_ba_overlap(
+    attn,
+    hidden_states: torch.Tensor,
+    qkv_names: tuple[str, ...],
+    sp_num_tokens: int | None,
+) -> tuple[list[torch.Tensor], torch.Tensor, torch.Tensor]:
+    """Input projections with the fused ``in_proj_ba`` forked to one side
+    stream.
+
+    Module-level on purpose: ``patch_qwen3_5.py`` injects this file's
+    ``forward`` onto the *upstream* ``QwenGatedDeltaNetAttention`` class by
+    copying individual methods, so anything ``forward`` reaches through
+    ``self`` must be on that copy list. Plain functions in this module (like
+    ``project_with_shared_quant``) resolve through the forward's own module
+    globals and are immune to that list.
+
+    The fused ba GEMV (hidden_size -> 2 * num_v_heads, ~5us at decode) reads
+    the same layernormed hidden states as the qkv(z) projection and its b/a
+    halves are consumed only by the gating kernel after the causal conv, so
+    the whole thing - GEMV plus the ``chunk``/``contiguous`` split - hides
+    under the ~15us main-stream qkv(z) matmul window. The module layout is
+    untouched: ``in_proj_ba`` stays exactly as the checkpoint loads it
+    (including LoRA-wrapped layers), so outputs are identical to the serial
+    path, just computed off the critical path.
+
+    Under SP the gather happens on the main stream before the fork so both
+    branches see full rows. This drops the gather-after-quantize byte saving
+    of ``project_with_shared_quant`` for the qkv branch (the collective then
+    carries bf16 instead of quantized bytes); for unquantized models - the
+    common case - the gather is unchanged.
+    """
+    if sp_num_tokens is not None:
+        from vllm_ascend.models.common.ops.sequence_parallel import sp_all_gather
+
+        hidden_states = sp_all_gather(hidden_states)[:sp_num_tokens]
+        sp_num_tokens = None
+
+    main_stream = torch.npu.current_stream()
+    ba_stream = _gdn_ba_side_stream()
+    hidden_ready = main_stream.record_event()
+    hidden_states.record_stream(ba_stream)
+    with npu_stream_switch(ba_stream):
+        ba_stream.wait_event(hidden_ready)
+        ba = attn.in_proj_ba(hidden_states)[0]
+        b, a = attn._split_ba_for_tp(ba)
+        b = b.contiguous()
+        a = a.contiguous()
+        ba_ready = ba_stream.record_event()
+
+    projections = project_with_shared_quant(attn, hidden_states, qkv_names, sp_num_tokens)
+
+    main_stream.wait_event(ba_ready)
+    b.record_stream(main_stream)
+    a.record_stream(main_stream)
+    return projections, b, a
 
 
 @lru_cache(maxsize=1)
@@ -443,27 +527,36 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         """
         num_tokens = sp_num_tokens if sp_num_tokens is not None else hidden_states.size(0)
         if hasattr(self, "in_proj_qkv"):
-            mixed_qkv, ba, z = project_with_shared_quant(
-                self, hidden_states, ("in_proj_qkv", "in_proj_ba", "in_proj_z"), sp_num_tokens
-            )
+            if _ba_overlap_stream_enabled():
+                (mixed_qkv, z), b, a = _project_inputs_ba_overlap(
+                    self, hidden_states, ("in_proj_qkv", "in_proj_z"), sp_num_tokens
+                )
+            else:
+                mixed_qkv, ba, z = project_with_shared_quant(
+                    self, hidden_states, ("in_proj_qkv", "in_proj_ba", "in_proj_z"), sp_num_tokens
+                )
+                b, a = self._split_ba_for_tp(ba)
+                b = b.contiguous()
+                a = a.contiguous()
             z = z.reshape(z.size(0), -1, self.head_v_dim)
-            b, a = self._split_ba_for_tp(ba)
-            b = b.contiguous()
-            a = a.contiguous()
         else:
             if not self.gqa_interleaved_layout:
-                mixed_qkvz, ba = project_with_shared_quant(
-                    self, hidden_states, ("in_proj_qkvz", "in_proj_ba"), sp_num_tokens
-                )
+                if _ba_overlap_stream_enabled():
+                    (mixed_qkvz,), b, a = _project_inputs_ba_overlap(
+                        self, hidden_states, ("in_proj_qkvz",), sp_num_tokens
+                    )
+                else:
+                    mixed_qkvz, ba = project_with_shared_quant(
+                        self, hidden_states, ("in_proj_qkvz", "in_proj_ba"), sp_num_tokens
+                    )
+                    b, a = self._split_ba_for_tp(ba)
+                    b = b.contiguous()
+                    a = a.contiguous()
                 num_tokens = mixed_qkvz.size(0)
                 qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
                 z_size = self.value_dim // self.tp_size
                 mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
                 z = z.reshape(z.size(0), -1, self.head_v_dim)
-                b, a = self._split_ba_for_tp(ba)
-
-                b = b.contiguous()
-                a = a.contiguous()
             else:
                 projected_states_qkvz, projected_states_ba = project_with_shared_quant(
                     self, hidden_states, ("in_proj_qkvz", "in_proj_ba"), sp_num_tokens
