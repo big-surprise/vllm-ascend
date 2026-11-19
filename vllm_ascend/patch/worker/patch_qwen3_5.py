@@ -36,7 +36,11 @@ except ImportError:
 
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.models.common.ops.sequence_parallel import sp_all_gather, sp_reduce_scatter
-from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention, initialize_packed_conv_weight
+from vllm_ascend.ops.gdn import (
+    AscendGatedDeltaNetAttention,
+    initialize_fused_ba_weight,
+    initialize_packed_conv_weight,
+)
 from vllm_ascend.ops.gemma_norm_weight import gemma_norm_weight
 from vllm_ascend.ops.mlp_weight_prefetch import dense_mlp_with_prefetch
 from vllm_ascend.ops.shared_quant_proj import project_with_shared_quant
@@ -376,3 +380,15 @@ else:
     # ascend_config.enable_gdn_qkv_split when a layer is built, since the
     # config is not initialized yet at patch import time.
     apply_gdn_qkv_split_patch()
+
+    # Last in the __init__ chain: the projection modules are now final (the
+    # qkv split above may have replaced them), so hook the qkv linear's
+    # post-load callback to fuse ba's weight before compilation/capture.
+    _GDN_INIT_AFTER_SPLIT = _GDN_PATCH_TARGET.__init__
+
+    @wraps(_GDN_INIT_AFTER_SPLIT)
+    def _gdn_init_with_fused_ba(self, *args, **kwargs):
+        _GDN_INIT_AFTER_SPLIT(self, *args, **kwargs)
+        initialize_fused_ba_weight(self)
+
+    _GDN_PATCH_TARGET.__init__ = _gdn_init_with_fused_ba

@@ -91,6 +91,143 @@ def _gate_norm_fusion_enabled() -> bool:
 
 
 @lru_cache(maxsize=1)
+def _ba_fused_proj_enabled() -> bool:
+    """Read the switch once; it cannot change within a process.
+
+    The config field keeps its original name ``enable_gdn_ba_overlap_stream``
+    so existing deployment scripts keep working, but the implementation is
+    now a single fused matmul, not a side-stream overlap (see below).
+    """
+    from vllm_ascend.ascend_config import get_ascend_config
+
+    return get_ascend_config().enable_gdn_ba_overlap_stream
+
+
+def fuse_ba_into_qkvz(attn) -> None:
+    """Append ba's output columns to the qkv(z) weight after loading.
+
+    Called from the layer's ``process_weights_after_loading`` hook - after
+    checkpoint weights are loaded and BEFORE compilation/capture, so no
+    module mutation happens inside a dynamo-traced forward.
+
+    Why NOT multi-stream: two Cube matmuls cannot run concurrently on Ascend
+    even on separate streams. ops/kimi_kda.py states it explicitly ("the two
+    Cube matmuls remain serialized"); that implementation only overlaps a
+    Cube matmul with VECTOR work. Our ba GEMV and the qkv(z) projection are
+    both Cube matmuls, so the earlier fork/join never hid the 5us ba kernel;
+    it merely added two cross-stream events, one stream switch and two
+    record_stream calls per layer (~4us x 48 layers ~= 0.2ms) - exactly the
+    measured regression.
+
+    Appending ba's 24 columns to the qkv(z) weight instead puts both
+    projections in ONE Cube GEMM: N grows from 4096 to 4120 (+0.6%, so the
+    matmul time is unchanged) and the separate 5us ba kernel disappears.
+    No streams, no events, no extra kernel launches, bitwise-identical
+    outputs (the qkv weight rows are copied untouched).
+
+    The fused weight is cached as a plain tensor attribute (~42MB per layer
+    at TP4); the original modules are left intact so weight prefetch,
+    mega_gdn and layerwise reload keep working, at the cost of one extra
+    copy of the qkv(z) weight per GDN layer. Only plain unquantized,
+    non-LoRA, non-interleaved layouts qualify; everything else silently
+    falls back to the original serial path (never slower than baseline).
+    """
+    if not _ba_fused_proj_enabled() or getattr(attn, "_ba_fused", False):
+        return
+    if getattr(attn, "gqa_interleaved_layout", False):
+        return
+    main = getattr(attn, "in_proj_qkv", None)
+    if main is None:
+        main = getattr(attn, "in_proj_qkvz", None)
+    ba = getattr(attn, "in_proj_ba", None)
+    if main is None or ba is None:
+        return
+    # LoRA replaces the linear with a wrapper holding the real weight under
+    # base_layer; quant schemes carry separate scales. Both keep serial.
+    if hasattr(main, "base_layer") or hasattr(ba, "base_layer"):
+        return
+    mw, bw = getattr(main, "weight", None), getattr(ba, "weight", None)
+    if mw is None or bw is None or mw.dtype != bw.dtype:
+        return
+    if mw.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        return
+    if getattr(main, "bias", None) is not None or getattr(ba, "bias", None) is not None:
+        return
+    if getattr(main, "weight_scale", None) is not None or getattr(ba, "weight_scale", None) is not None:
+        return
+    with torch.no_grad():
+        fused_w = torch.cat([mw.detach(), bw.detach()], dim=0).contiguous()
+    # Non-persistent buffer: follows .to(device) like the original weights,
+    # is visible to dynamo as a plain tensor, and stays out of state_dict.
+    attn.register_buffer("_fused_qkvz_ba_w", fused_w, persistent=False)
+    attn._main_cols = mw.shape[0]
+    attn._ba_cols = bw.shape[0]
+    attn._ba_fused = True
+
+
+def initialize_fused_ba_weight(layer: nn.Module) -> None:
+    """Hook the qkv projection's post-load callback to fuse ba afterwards.
+
+    Same mechanism as ``initialize_packed_conv_weight``: vLLM's loader calls
+    ``quant_method.process_weights_after_loading(module)`` on every linear
+    after the checkpoint is applied, so chaining onto it puts the fusion
+    exactly between weight loading and graph capture - no module mutation
+    is ever seen by dynamo. The switch is checked inside
+    ``fuse_ba_into_qkvz``, at post-load time, not here: ascend_config is
+    unavailable while patches are being imported.
+    """
+    main = getattr(layer, "in_proj_qkv", None)
+    if main is None:
+        main = getattr(layer, "in_proj_qkvz", None)
+    quant_method = getattr(main, "quant_method", None)
+    if quant_method is None:
+        return
+    process_weights_after_loading = getattr(quant_method, "process_weights_after_loading", None)
+    if process_weights_after_loading is None:
+        return
+
+    # A quant_method instance may be shared by several linears; install the
+    # wrapper once and collect every layer it must fuse, instead of stacking
+    # one wrapper per layer on the same instance.
+    layers = getattr(quant_method, "_ascend_ba_fuse_layers", None)
+    if layers is None:
+        layers = []
+        quant_method._ascend_ba_fuse_layers = layers
+
+        @wraps(process_weights_after_loading)
+        def process_weights_and_fuse(*args, **kwargs):
+            result = process_weights_after_loading(*args, **kwargs)
+            for target in layers:
+                fuse_ba_into_qkvz(target)
+            return result
+
+        quant_method.process_weights_after_loading = process_weights_and_fuse
+    layers.append(layer)
+
+
+def _fused_ba_inputs(
+    attn,
+    hidden_states: torch.Tensor,
+    sp_num_tokens: int | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One GEMM for the qkv(z) projection and ba, then split the outputs.
+
+    Module-level on purpose: ``patch_qwen3_5.py`` injects this file's
+    ``forward`` onto the *upstream* class by copying individual methods, so
+    anything ``forward`` reaches through ``self`` must be on that copy list.
+    Plain functions here resolve through the forward's own module globals.
+    """
+    if sp_num_tokens is not None:
+        from vllm_ascend.models.common.ops.sequence_parallel import sp_all_gather
+
+        hidden_states = sp_all_gather(hidden_states)[:sp_num_tokens]
+    fused = torch.nn.functional.linear(hidden_states, attn._fused_qkvz_ba_w)
+    main, ba = fused.split([attn._main_cols, attn._ba_cols], dim=-1)
+    b, a = attn._split_ba_for_tp(ba)
+    return hidden_states, main, b.contiguous(), a.contiguous()
+
+
+@lru_cache(maxsize=1)
 def _get_fla_gdn_prefill_op():
     try:
         from fla_npu.ops.ascendc import chunk_gated_delta_rule_fwd  # type: ignore[import-not-found]
@@ -443,27 +580,37 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         """
         num_tokens = sp_num_tokens if sp_num_tokens is not None else hidden_states.size(0)
         if hasattr(self, "in_proj_qkv"):
-            mixed_qkv, ba, z = project_with_shared_quant(
-                self, hidden_states, ("in_proj_qkv", "in_proj_ba", "in_proj_z"), sp_num_tokens
-            )
+            if getattr(self, "_ba_fused", False):
+                hidden_states, mixed_qkv, b, a = _fused_ba_inputs(
+                    self, hidden_states, sp_num_tokens
+                )
+                z = self.in_proj_z(hidden_states)[0]
+            else:
+                mixed_qkv, ba, z = project_with_shared_quant(
+                    self, hidden_states, ("in_proj_qkv", "in_proj_ba", "in_proj_z"), sp_num_tokens
+                )
+                b, a = self._split_ba_for_tp(ba)
+                b = b.contiguous()
+                a = a.contiguous()
             z = z.reshape(z.size(0), -1, self.head_v_dim)
-            b, a = self._split_ba_for_tp(ba)
-            b = b.contiguous()
-            a = a.contiguous()
         else:
             if not self.gqa_interleaved_layout:
-                mixed_qkvz, ba = project_with_shared_quant(
-                    self, hidden_states, ("in_proj_qkvz", "in_proj_ba"), sp_num_tokens
-                )
+                if getattr(self, "_ba_fused", False):
+                    _, mixed_qkvz, b, a = _fused_ba_inputs(
+                        self, hidden_states, sp_num_tokens
+                    )
+                else:
+                    mixed_qkvz, ba = project_with_shared_quant(
+                        self, hidden_states, ("in_proj_qkvz", "in_proj_ba"), sp_num_tokens
+                    )
+                    b, a = self._split_ba_for_tp(ba)
+                    b = b.contiguous()
+                    a = a.contiguous()
                 num_tokens = mixed_qkvz.size(0)
                 qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
                 z_size = self.value_dim // self.tp_size
                 mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
                 z = z.reshape(z.size(0), -1, self.head_v_dim)
-                b, a = self._split_ba_for_tp(ba)
-
-                b = b.contiguous()
-                a = a.contiguous()
             else:
                 projected_states_qkvz, projected_states_ba = project_with_shared_quant(
                     self, hidden_states, ("in_proj_qkvz", "in_proj_ba"), sp_num_tokens
