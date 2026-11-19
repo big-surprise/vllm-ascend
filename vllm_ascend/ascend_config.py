@@ -624,6 +624,21 @@ class AscendConfig:
     # output at the cost of one extra matmul. Qwen3.5 only: the Qwen3-Next
     # interleaved layout stores qkvz as one tensor that cannot be split.
     enable_gdn_qkv_split: bool = False
+    # Eliminate the Qwen3.5 GDN ``in_proj_ba`` GEMV (~5us/layer at decode)
+    # by appending its output columns to the qkv(z) weight after loading,
+    # so ONE Cube matmul computes both. Two Cube matmuls cannot overlap on
+    # Ascend even on separate streams (see ops/kimi_kda.py), so the earlier
+    # side-stream fork/join only added ~4us/layer of event overhead and
+    # regressed decode by ~0.2ms; the fused matmul has no streams/events.
+    # Field name kept for compatibility with existing deployment configs.
+    #
+    # Costs one extra copy of the qkv(z) weight per GDN layer (~42MB at
+    # TP4, ~2GB/rank over 48 layers). Falls back silently to the original
+    # serial path on quantized / LoRA / interleaved / bias layouts, and
+    # composes with enable_gdn_qkv_split (ba fuses into in_proj_qkv).
+    #
+    #   --additional-config '{"enable_gdn_ba_overlap_stream": true}'
+    enable_gdn_ba_overlap_stream: bool = False
     draft_window_size: int | None = None
     mix_placement: bool = False
     # When non-zero, force the MC2 combine stage's comm quant_mode to this
