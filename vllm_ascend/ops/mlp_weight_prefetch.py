@@ -24,6 +24,27 @@ MLP_PREFETCH_TOKEN_THRESHOLD = 500
 ALLREDUCE_NORM_FUSE_THRESHOLD = 512
 
 
+def _decode_ar_prefetch() -> tuple[bool, int]:
+    """(enabled, per-call cap in bytes) for the decode AR-window switch.
+
+    Deliberately independent of ``weight_prefetch_config.enabled``: that
+    switch also enables the MoE/MLP prefetch machinery, while this one only
+    unlocks the two all-reduce fork points below. Read fresh on every call
+    (no lru_cache) so a not-yet-initialized config degrades to off without
+    poisoning a cached value.
+    """
+    try:
+        from vllm_ascend.ascend_config import get_ascend_config
+
+        cfg = get_ascend_config()
+        if not bool(getattr(cfg, "enable_decode_ar_prefetch", False)):
+            return False, 0
+        mib = int(getattr(cfg, "decode_ar_prefetch_max_mib", 48))
+        return True, mib * 1024 * 1024
+    except Exception:  # noqa: BLE001 - config may not exist yet
+        return False, 0
+
+
 def _uses_all_reduce_prefetch(projection):
     """Only suppress the Norm fallback for projections with a real issue site."""
     from vllm_ascend.ops.linear import AscendRowParallelLinear
@@ -38,9 +59,18 @@ def _uses_all_reduce_prefetch(projection):
 
 
 def _attention_gate_up_target(prefix):
-    """Resolve only the current decoder's unfused Attention output reduction."""
+    """Resolve only the current decoder's unfused Attention output reduction.
+
+    Normally gated on ``use_qwen_dense_mlp_prefetch``. With
+    ``enable_decode_ar_prefetch`` the same fork point is also available when
+    only the AR-window prefetch is wanted (weight_prefetch_config.enabled may
+    stay False); ``is_qwen_dense`` still guards the model type.
+    """
     method = get_weight_prefetch_method()
-    if method is None or not method.use_qwen_dense_mlp_prefetch:
+    decode_ar, _ = _decode_ar_prefetch()
+    if method is None or not (
+        method.use_qwen_dense_mlp_prefetch or (decode_ar and method.is_qwen_dense)
+    ):
         return None
     if not prefix.endswith((".self_attn.o_proj", ".linear_attn.out_proj")):
         return None
@@ -85,7 +115,11 @@ def _next_layer_input_proj_target(prefix):
     method = get_weight_prefetch_method()
     if method is None or not method.is_qwen_dense:
         return None
-    if not method.attn.enable or not prefix.endswith(".mlp.down_proj"):
+    decode_ar, _ = _decode_ar_prefetch()
+    # With the dedicated decode switch, attn.enable no longer has to be on:
+    # the AR window is useful on its own. Keep the attn.enable check as the
+    # primary path so the legacy config behaves exactly as before.
+    if not (method.attn.enable or decode_ar) or not prefix.endswith(".mlp.down_proj"):
         return None
     idx = layer_idx_from_prefix(prefix)
     layers = layers_of_model_instance(_EXTRA_CTX.model_instance)
@@ -147,7 +181,14 @@ def all_reduce_with_weight_prefetch(
     evaluates the gate with its actual shape. Returning the reduction puts
     the op on the real data path; no unused side-effect-only node is needed.
     """
-    size = _prefetch_size(weight, ratio)
+    # ``reduce_first`` is exactly ``prefix.endswith(".mlp.down_proj")``: that
+    # is the fork whose target is the 4120x5120 fused GDN weight (or the next
+    # layer's in_proj_qkvz). It is the ONLY site allowed to use the larger
+    # AR-window byte budget. The o_proj/out_proj fork targets gate_up_proj
+    # and, like every legacy MoE/MLP/attn prefetch site, keeps 22MiB.
+    # Passing the same predicate to the gate and to the issue keeps both in
+    # agreement about how many bytes are actually fetched.
+    size = _prefetch_size(weight, ratio, ar_window=reduce_first)
     if size <= 0 or not 0 < output.shape[0] < MLP_PREFETCH_TOKEN_THRESHOLD:
         return tensor_model_parallel_all_reduce(output)
 
@@ -161,7 +202,7 @@ def all_reduce_with_weight_prefetch(
         with npu_stream_switch(stream):
             torch_npu.npu_prefetch(weight, None, size, 0)
     else:
-        stream = _start_prefetch(weight, output, ratio)
+        stream = _start_prefetch(weight, output, ratio, ar_window=reduce_first)
         output = tensor_model_parallel_all_reduce(output)
     _finish_prefetch(stream)
     return output
@@ -173,14 +214,38 @@ def _all_reduce_with_weight_prefetch_fake(
     return torch.empty_like(output)
 
 
-def _prefetch_size(weight: torch.Tensor, ratio: float) -> int:
-    return min(int(weight.numel() * weight.element_size() * ratio), MAX_PREFETCH_WEIGHT_SIZE)
+def _prefetch_size(weight: torch.Tensor, ratio: float, *, ar_window: bool = False) -> int:
+    """Byte budget for one npu_prefetch call.
+
+    ``ar_window`` must be set only by ``all_reduce_with_weight_prefetch``.
+    The 48MiB ceiling exists solely for the fused GDN weight read from the
+    decode all-reduce window; raising it for every call site would also
+    double the gate_up_proj / down_proj prefetch traffic of
+    ``prefetch_swiglu``, ``prefetch_gemma_rms_norm``, split-qkv and the GDN
+    core, pushing those fetches past the 28.9us collective they are meant
+    to hide behind. All legacy sites therefore keep MAX_PREFETCH_WEIGHT_SIZE.
+    """
+    cap = MAX_PREFETCH_WEIGHT_SIZE
+    if ar_window:
+        decode_ar, ar_cap = _decode_ar_prefetch()
+        if decode_ar and ar_cap > cap:
+            # The 4120x5120 bf16 fused GDN weight is 40.23MiB; the legacy
+            # 22MiB cap warmed only its first half, leaving the tail in HBM.
+            cap = ar_cap
+    return min(int(weight.numel() * weight.element_size() * ratio), cap)
 
 
-def _start_prefetch(weight: torch.Tensor, dependency: torch.Tensor, ratio: float, num_tokens: int | None = None):
+def _start_prefetch(
+    weight: torch.Tensor,
+    dependency: torch.Tensor,
+    ratio: float,
+    num_tokens: int | None = None,
+    *,
+    ar_window: bool = False,
+):
     # Decide inside the op: profile_run may trace at a prefill size while
     # ACL graphs are subsequently captured at smaller decode sizes.
-    size = _prefetch_size(weight, ratio)
+    size = _prefetch_size(weight, ratio, ar_window=ar_window)
     tokens = dependency.shape[0] if num_tokens is None else num_tokens
     if size <= 0 or not 0 < tokens < MLP_PREFETCH_TOKEN_THRESHOLD:
         return None

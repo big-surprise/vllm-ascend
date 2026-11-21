@@ -308,10 +308,15 @@ class NPUModelRunner(GPUModelRunner):
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
         aux_layers = get_pd_dspark_aux_layer_ids(self.vllm_config)
         super().load_model(load_dummy_weights, *args, **kwargs)
-        if self.ascend_config.weight_prefetch_config.enabled:
+        if self.ascend_config.weight_prefetch_config.enabled or getattr(
+            self.ascend_config, "enable_decode_ar_prefetch", False
+        ):
             # Upstream V2 creates ForwardContext without a model reference.
             # Bind at the actual model call, including graph-capture wrappers,
             # so each warmup/forward resets the cursor to this PP rank's start.
+            # The AR-window prefetch resolves next-layer targets through
+            # _EXTRA_CTX.model_instance too, so the hook must also be
+            # installed when only that dedicated switch is on.
             self.model.register_forward_pre_hook(set_weight_prefetch_context)
             draft_model = self.get_draft_model()
             if draft_model is not None and draft_model is not self.model:

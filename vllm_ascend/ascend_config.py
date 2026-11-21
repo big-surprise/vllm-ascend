@@ -447,6 +447,8 @@ class AscendConfig:
             "enable_mc2_hierarchy_comm": false,
             "enable_dsa_cp": false,
             "allreduce_outplace": false,
+            "enable_decode_ar_prefetch": false,
+            "decode_ar_prefetch_max_mib": 48,
             "sfa_dcp_force_tmajor_restore": false,
             "enable_force_eplb": false,
             "enable_pcp_o_proj_weight_sharding": true,
@@ -616,6 +618,37 @@ class AscendConfig:
     #
     #   --additional-config '{"allreduce_outplace": true}'
     allreduce_outplace: bool = False
+    # Use the otherwise-idle decode all-reduce window to hide the next large
+    # weight's HBM->L2 traffic. On 950DT TP4 a decode step issues 129 small
+    # HcclAllReduce calls (~29us each, ~3.7ms/token in total); the compute
+    # stream is fenced off for that entire time. Online profiling vs a
+    # hot-L2 single-op benchmark attributed ~5us per GDN layer to a cold
+    # 4120x5120 fused weight (17.32us online vs 12.28us bare), i.e. the MTE2
+    # read sits INSIDE the GEMM's critical path. Issuing npu_prefetch on the
+    # prefetch stream during the collective moves that traffic into a window
+    # that is already paid for.
+    #
+    # This is NOT communication/compute overlap (the collectives stay on the
+    # critical path) and NOT MC2 / GEMM+AllReduce fusion (aclnnMatmulAllReduce
+    # is 0.32x at M=4 and its rtMemcpy aborts ACLGraph capture). It only
+    # unlocks the two AR-overlap fork points in mlp_weight_prefetch.py.
+    # Kept independent of weight_prefetch_config.enabled, which also turns on
+    # the MoE/MLP prefetch machinery and changes many other paths.
+    #
+    # Pair it with allreduce_outplace=true: the prefetch path calls
+    # tensor_model_parallel_all_reduce, whose default in-place implementation
+    # is unsafe inside a captured graph (see a37c98886). In eager mode the
+    # switch also works alone, but PIECEWISE/ACLGraph capture requires the
+    # out-of-place collective to be on.
+    #
+    #   --additional-config '{"allreduce_outplace": true,
+    #                        "enable_decode_ar_prefetch": true}'
+    enable_decode_ar_prefetch: bool = False
+    # Per-call cap for npu_prefetch issued from an AR window, in MiB. 48
+    # covers the 4120x5120 bf16 fused GDN weight (40.23MiB) in one shot;
+    # the legacy MAX_PREFETCH_WEIGHT_SIZE (22MiB) only warmed about half of
+    # it, leaving the tail cold. Bounded to [1, 256] in the validator.
+    decode_ar_prefetch_max_mib: int = 48
     sfa_dcp_force_tmajor_restore: bool = False
     enable_force_eplb: bool = False
     enable_pcp_o_proj_weight_sharding: bool = True
@@ -725,6 +758,11 @@ class AscendConfig:
     def _validate_user_input_ranges(self):
         if self.weight_nz_mode not in (0, 1, 2):
             raise ValueError(f"weight_nz_mode must be one of 0, 1, or 2; got {self.weight_nz_mode}")
+        if not 1 <= self.decode_ar_prefetch_max_mib <= 256:
+            raise ValueError(
+                "decode_ar_prefetch_max_mib must be within [1, 256]; "
+                f"got {self.decode_ar_prefetch_max_mib}"
+            )
         # TODO(zzzzwwjj): remove it after deprecating `enable_mc2_hierarchy_comm`.
         if self.enable_mc2_hierarchy_comm:
             self.mc2_comm_alg = "hierarchy"
