@@ -54,6 +54,12 @@ from vllm_ascend.ops.mega_gdn_decode import (
 )
 from vllm_ascend.ops.shared_quant_proj import project_with_shared_quant
 from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
+from vllm_ascend.ops.triton.fla.fused_ba_split_contiguous import (
+    can_fuse_ba_split,
+    can_fuse_split,
+    fused_ba_split_contiguous,
+    fused_split_contiguous,
+)
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.fused_gdn_gating_l2norm import (
@@ -239,16 +245,33 @@ def initialize_fused_ba_weight(layer: nn.Module) -> None:
     layers.append(layer)
 
 
+# Decode batches only.  Prefill forwards (M in the thousands) already pay
+# ~150-310ms of GEMM time, so three Slice launches are noise there, while a
+# large grid of one-row programs would be a poor fit for the vector cores.
+_FUSED_SPLIT_MAX_M = 16
+
+
 def _fused_ba_inputs(
     attn,
     hidden_states: torch.Tensor,
     sp_num_tokens: int | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """One GEMM for the qkv(z) projection and ba, then split the outputs.
 
     The fused weight has exactly ``main_cols + ba_cols`` rows (4120 at TP4),
-    so a single 2-way ``split`` (views, no extra kernel) hands the rest of
-    the forward the same ``[qkv(z) | ba]`` tensors as the unfused path.
+    so a single 2-way ``split`` hands the rest of the forward the same
+    ``[qkv(z) | ba]`` tensors as the unfused path.  Returns
+    ``(hidden_states, mixed_qkv, z, b, a)``; callers using a separate
+    ``in_proj_z`` ignore the (zero-column) ``z`` produced here.
+
+    Those column slices are views with a 4120-wide row stride.  At M == 1
+    they are already "contiguous" (stride(0) is irrelevant for one row) and
+    cost nothing.  At M > 1 every contiguous-requiring consumer materialises
+    its slice with a separate SliceAiCore kernel: msprof on 950DT/TP4/con4
+    counted 4320 + 4320 + 2160 = 10800 launches in the M=4 decode forwards,
+    ~254us per forward over 48 GDN layers.  ``fused_ba_split_contiguous``
+    folds the three copies into one vector-core launch.  ``z`` stays a view:
+    its downstream reshape is free, so copying it would only add HBM traffic.
 
     Module-level on purpose: ``patch_qwen3_5.py`` injects this file's
     ``forward`` onto the *upstream* class by copying individual methods, so
@@ -259,10 +282,33 @@ def _fused_ba_inputs(
         from vllm_ascend.models.common.ops.sequence_parallel import sp_all_gather
 
         hidden_states = sp_all_gather(hidden_states)[:sp_num_tokens]
+
     fused = torch.nn.functional.linear(hidden_states, attn._fused_qkvz_ba_w)
     main, ba = fused.split([attn._main_cols, attn._ba_cols], dim=-1)
     b, a = attn._split_ba_for_tp(ba)
-    return hidden_states, main, b.contiguous(), a.contiguous()
+
+    # ``main`` is qkv only when a separate in_proj_z exists, otherwise qkv+z.
+    # Deriving qkv_size from the module dims keeps both branches on one path.
+    qkv_size = min(
+        (attn.key_dim * 2 + attn.value_dim) // attn.tp_size,
+        attn._main_cols,
+    )
+    mixed_qkv, z = main.split([qkv_size, attn._main_cols - qkv_size], dim=-1)
+
+    m = fused.shape[0]
+    if m == 1:
+        # Single-concurrency decode: keep the exact original tensor identities
+        # (also matters for already-captured ACL graphs). Zero extra kernels.
+        return hidden_states, mixed_qkv, z, b, a
+    if m <= _FUSED_SPLIT_MAX_M and can_fuse_ba_split(mixed_qkv, b, a):
+        mixed_qkv, b, a = fused_ba_split_contiguous(mixed_qkv, b, a)
+    else:
+        # Prefill-sized batches and any exotic split_ba layout stay on the
+        # proven per-slice path - never slower than the baseline.
+        mixed_qkv = mixed_qkv.contiguous()
+        b = b.contiguous()
+        a = a.contiguous()
+    return hidden_states, mixed_qkv, z, b, a
 
 
 @lru_cache(maxsize=1)
@@ -436,15 +482,38 @@ def _rearrange_decode_qkv(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Expose contiguous token-major Q/K/V without an intermediate concat.
 
-    Multi-token split views can have gaps between rows, so each component
-    still needs its own contiguous buffer. Single-token views need no copy.
+    Multi-token split views have a row stride of ``key_dim*2 + value_dim``, so
+    each component needs its own contiguous buffer.  At M == 1 the split views
+    are already contiguous and ``.contiguous()`` is a no-op; at M > 1 three
+    separate SliceAiCore launches were the second big source of decode AIV
+    time (msprof: 6480 kernels / 11.63ms over 45 forwards at con4, ~258us per
+    forward over 48 GDN layers).  ``fused_split_contiguous`` folds them into
+    one vector-core launch, reusing the same kernel as the fused qkvz+ba
+    split.
+
+    Prefill-sized batches (M > _FUSED_SPLIT_MAX_M) and any exotic conv layout
+    fall back to the proven per-slice ``.contiguous()`` path.
     """
     num_tokens = mixed_qkv.shape[0]
     query, key, value = mixed_qkv.split((key_dim, key_dim, value_dim), dim=-1)
+    if num_tokens == 1:
+        # Keep the exact original tensor identities (matters for captured
+        # ACL graphs); .contiguous() is a no-op for a single row.
+        return (
+            query.contiguous().view(1, num_tokens, key_dim // head_k_dim, head_k_dim),
+            key.contiguous().view(1, num_tokens, key_dim // head_k_dim, head_k_dim),
+            value.contiguous().view(1, num_tokens, value_dim // head_v_dim, head_v_dim),
+        )
+    if num_tokens <= _FUSED_SPLIT_MAX_M and can_fuse_split(query, key, value):
+        query, key, value = fused_split_contiguous(query, key, value)
+    else:
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
     return (
-        query.contiguous().view(1, num_tokens, key_dim // head_k_dim, head_k_dim),
-        key.contiguous().view(1, num_tokens, key_dim // head_k_dim, head_k_dim),
-        value.contiguous().view(1, num_tokens, value_dim // head_v_dim, head_v_dim),
+        query.view(1, num_tokens, key_dim // head_k_dim, head_k_dim),
+        key.view(1, num_tokens, key_dim // head_k_dim, head_k_dim),
+        value.view(1, num_tokens, value_dim // head_v_dim, head_v_dim),
     )
 
 
@@ -619,7 +688,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         num_tokens = sp_num_tokens if sp_num_tokens is not None else hidden_states.size(0)
         if hasattr(self, "in_proj_qkv"):
             if getattr(self, "_ba_fused", False):
-                hidden_states, mixed_qkv, b, a = _fused_ba_inputs(
+                # This branch has a separate in_proj_z; the fused GEMM's
+                # zero-column z is intentionally discarded.
+                hidden_states, mixed_qkv, _fused_z_unused, b, a = _fused_ba_inputs(
                     self, hidden_states, sp_num_tokens
                 )
                 z = self.in_proj_z(hidden_states)[0]
@@ -634,9 +705,13 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             if not self.gqa_interleaved_layout:
                 if getattr(self, "_ba_fused", False):
-                    _, mixed_qkvz, b, a = _fused_ba_inputs(
+                    # Fused path already returns split qkv / z / b / a, with
+                    # the three contiguous-requiring tensors materialised in
+                    # one kernel instead of three SliceAiCore launches.
+                    _, mixed_qkv, z, b, a = _fused_ba_inputs(
                         self, hidden_states, sp_num_tokens
                     )
+                    num_tokens = mixed_qkv.size(0)
                 else:
                     mixed_qkvz, ba = project_with_shared_quant(
                         self, hidden_states, ("in_proj_qkvz", "in_proj_ba"), sp_num_tokens
@@ -644,10 +719,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     b, a = self._split_ba_for_tp(ba)
                     b = b.contiguous()
                     a = a.contiguous()
-                num_tokens = mixed_qkvz.size(0)
-                qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
-                z_size = self.value_dim // self.tp_size
-                mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
+                    num_tokens = mixed_qkvz.size(0)
+                    qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
+                    z_size = self.value_dim // self.tp_size
+                    mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
                 z = z.reshape(z.size(0), -1, self.head_v_dim)
             else:
                 projected_states_qkvz, projected_states_ba = project_with_shared_quant(
