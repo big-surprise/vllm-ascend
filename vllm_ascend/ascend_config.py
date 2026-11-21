@@ -462,6 +462,7 @@ class AscendConfig:
             "msmonitor_use_daemon": false,
             "enable_transpose_kv_cache_by_block": true,
             "weight_nz_mode": 1,
+            "enable_gdn_ba_overlap_stream": false,
             "enable_shared_expert_dp": false,
             "enable_sparse_sfa_c8": false,
             "enable_sparse_li_c8": false,
@@ -639,6 +640,13 @@ class AscendConfig:
     #
     #   --additional-config '{"enable_gdn_ba_overlap_stream": true}'
     enable_gdn_ba_overlap_stream: bool = False
+    # The fused qkvz+ba GEMM always keeps the exact N = main_cols + ba_cols
+    # (4120 at TP4). An earlier experiment padded N to rebalance the AI_CORE
+    # tiling; single-op profiling showed every padded N is slower (extra
+    # zero rows only add MTE2 traffic) and MIX_AIC cannot be restored for any
+    # N >= 4120 (it needs N <= n_aic*128 = 4096 on 950DT). The alignment
+    # switch was therefore removed; see benchmarks/bench_gdn_fused_qkvz_ba.py
+    # for the measurement and .workbuddy memory notes for the full rationale.
     draft_window_size: int | None = None
     mix_placement: bool = False
     # When non-zero, force the MC2 combine stage's comm quant_mode to this
