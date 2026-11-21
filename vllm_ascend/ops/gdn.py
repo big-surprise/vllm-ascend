@@ -120,17 +120,34 @@ def fuse_ba_into_qkvz(attn) -> None:
     measured regression.
 
     Appending ba's 24 columns to the qkv(z) weight instead puts both
-    projections in ONE Cube GEMM: N grows from 4096 to 4120 (+0.6%, so the
-    matmul time is unchanged) and the separate 5us ba kernel disappears.
-    No streams, no events, no extra kernel launches, bitwise-identical
-    outputs (the qkv weight rows are copied untouched).
+    projections in ONE Cube GEMM: N grows from 4096 to 4120 (+0.6%) and the
+    separate 5us ba kernel disappears. No streams, no events, no extra kernel
+    launches, bitwise-identical outputs. N stays EXACTLY main_cols+ba_cols:
+    padding it was measured slower on every candidate (extra zero rows only
+    add MTE2 traffic) and cannot restore MIX_AIC, which needs
+    N <= n_aic*128 = 4096 on 950DT.
 
-    The fused weight is cached as a plain tensor attribute (~42MB per layer
-    at TP4); the original modules are left intact so weight prefetch,
-    mega_gdn and layerwise reload keep working, at the cost of one extra
-    copy of the qkv(z) weight per GDN layer. Only plain unquantized,
-    non-LoRA, non-interleaved layouts qualify; everything else silently
-    falls back to the original serial path (never slower than baseline).
+    Single storage, not two copies: the fused [qkvz | ba] tensor is the ONLY
+    allocation. The two source linears' ``weight`` Parameters are rebound to
+    views into its first / last rows, preserving their exact shapes (so
+    quant_method, state_dict, layerwise reload and weight prefetch keep
+    working) while dropping the duplicate ~40MiB qkvz copy - about 2GiB per
+    rank over 48 GDN layers at TP4. Because the views share storage with the
+    fused buffer, an in-place RL weight update (vLLM's
+    ``replace_parameter(..., prefer_copy=True)``) copying into either source
+    weight is visible to the GEMM immediately; the old double-copy path
+    silently kept a stale fused weight after reload.
+
+    The GEMM is memory-bound (MTE2 weight traffic dominates), so
+    ``_next_layer_input_proj_target`` in mlp_weight_prefetch.py prefetches
+    ``_fused_qkvz_ba_w`` - the tensor the GEMM actually reads - instead of
+    the superseded 4096-row source weight.
+
+    Only plain unquantized, non-LoRA, non-interleaved layouts qualify; if
+    rebinding the source weights fails we fall back to keeping both originals
+    alongside the fused copy (correct, just one extra copy). Everything else
+    silently falls back to the original serial path (never slower than
+    baseline).
     """
     if not _ba_fused_proj_enabled() or getattr(attn, "_ba_fused", False):
         return
@@ -155,14 +172,31 @@ def fuse_ba_into_qkvz(attn) -> None:
         return
     if getattr(main, "weight_scale", None) is not None or getattr(ba, "weight_scale", None) is not None:
         return
+    main_cols, ba_cols = mw.shape[0], bw.shape[0]
     with torch.no_grad():
         fused_w = torch.cat([mw.detach(), bw.detach()], dim=0).contiguous()
     # Non-persistent buffer: follows .to(device) like the original weights,
     # is visible to dynamo as a plain tensor, and stays out of state_dict.
     attn.register_buffer("_fused_qkvz_ba_w", fused_w, persistent=False)
-    attn._main_cols = mw.shape[0]
-    attn._ba_cols = bw.shape[0]
+    attn._main_cols = main_cols
+    attn._ba_cols = ba_cols
     attn._ba_fused = True
+    # Point the two source Parameters at views of the fused tensor so there is
+    # only ONE weight allocation. Rebinding ``.data`` (rather than assigning a
+    # fresh Parameter) keeps every attribute vLLM attached to the Parameter -
+    # weight_loader, shard offsets, quant scales - intact for layerwise
+    # reload, and preserves the Parameter object identity ACL graphs captured.
+    # Shapes stay identical, so an in-place RL weight update that copies into
+    # either source weight now lands in the fused buffer the GEMM actually
+    # reads (the old double-copy path kept a stale fused weight after reload).
+    # On any failure keep the originals: correctness, not sharing, is the
+    # hard requirement.
+    try:
+        mw.data = fused_w[:main_cols]
+        bw.data = fused_w[main_cols:]
+        attn._ba_fused_shared_storage = True
+    except (RuntimeError, TypeError, AttributeError, ValueError):
+        attn._ba_fused_shared_storage = False
 
 
 def initialize_fused_ba_weight(layer: nn.Module) -> None:
@@ -211,6 +245,10 @@ def _fused_ba_inputs(
     sp_num_tokens: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """One GEMM for the qkv(z) projection and ba, then split the outputs.
+
+    The fused weight has exactly ``main_cols + ba_cols`` rows (4120 at TP4),
+    so a single 2-way ``split`` (views, no extra kernel) hands the rest of
+    the forward the same ``[qkv(z) | ba]`` tensors as the unfused path.
 
     Module-level on purpose: ``patch_qwen3_5.py`` injects this file's
     ``forward`` onto the *upstream* class by copying individual methods, so

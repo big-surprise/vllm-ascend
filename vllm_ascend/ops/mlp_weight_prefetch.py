@@ -76,6 +76,11 @@ def _next_layer_input_proj_target(prefix):
     later. That is the same fork/consume shape the gate_up prefetch already
     uses at o_proj, so reuse it. Measured at TP4: 22.48us idle window against
     a 17.25us MTE2 for in_proj_qkvz (40MiB).
+
+    If that next layer is a GatedDeltaNet with ba fused into qkv(z), the
+    reader is the 4120-row ``_fused_qkvz_ba_w`` buffer, not the 4096-row
+    source weight - prefetch the fused buffer so the fetch lands on the
+    tensor the GEMM actually reads.
     """
     method = get_weight_prefetch_method()
     if method is None or not method.is_qwen_dense:
@@ -94,7 +99,16 @@ def _next_layer_input_proj_target(prefix):
         or getattr(attention, "in_proj_qkvz", None)
         or getattr(attention, "qkv_proj", None)
     )
-    weight = getattr(projection, "weight", None)
+    # With ba fused into qkv(z) (enable_gdn_ba_overlap_stream) the GEMM reads
+    # the 4120-row _fused_qkvz_ba_w buffer, not the 4096-row source weight.
+    # Prefetching the source weight would warm a tensor no kernel reads and
+    # leave the real one cold in HBM (~5us/layer of extra MTE2 measured on
+    # 950DT). Prefer the fused buffer whenever fusion is active.
+    fused_weight = getattr(attention, "_fused_qkvz_ba_w", None)
+    if fused_weight is not None and getattr(attention, "_ba_fused", False):
+        weight = fused_weight
+    else:
+        weight = getattr(projection, "weight", None)
     if weight is None:
         return None
     # The ordinary row-parallel and matmul_and_reduce paths both issue at
