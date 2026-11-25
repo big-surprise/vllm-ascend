@@ -92,6 +92,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Emit per-layer KVPool ranged transfer audit events. Default: 0 (disabled).
     # Valid values: 0 or 1. This configuration is not sensitive.
     "VLLM_ASCEND_KVPOOL_RANGE_DEBUG": lambda: _strict_binary_env("VLLM_ASCEND_KVPOOL_RANGE_DEBUG"),
+    # Enable the CANN ops-transformer flash_attn dual-operator attention
+    # backend (cann_ops_transformer.flash_attn_metadata + flash_attn) for
+    # non-MLA, non-sparse full-attention layers. The operator ABI is only
+    # available on the Ascend 950PR/950DT family (A5 profile) with a
+    # cann_ops_transformer build that ships the two APIs. Default: 0
+    # (disabled); valid values: 0 or 1. Read once at platform backend
+    # selection. Not sensitive.
+    "VLLM_ASCEND_ENABLE_FLASH_ATTN": lambda: _strict_binary_env("VLLM_ASCEND_ENABLE_FLASH_ATTN"),
     # Override the Unified Buffer (UB) size in KB for Triton kernel tile sizing.
     # 0 (default): auto-detect from device properties, falling back to 192 KB
     # (safe for Ascend 910B/A3). Set to a positive value to override when
