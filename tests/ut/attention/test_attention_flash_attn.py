@@ -75,16 +75,32 @@ class TestFlashAttnStepLengths(TestBase):
         self.impl = object.__new__(AscendFlashAttnImpl)
 
     def test_derivation_matches_the_tnd_contract(self):
+        # num_reqs slices the persistent buffers down to the valid prefix, so
+        # cu_seqlens_q has length num_reqs + 1 and seqused_kv length num_reqs.
         attn_metadata = SimpleNamespace(
+            num_reqs=2,
             query_start_loc_gpu=torch.tensor([0, 3, 5, -1, -1], dtype=torch.int32),
             seq_lens_gpu=torch.tensor([10, 20, 0, 0], dtype=torch.int32),
         )
         cu_seqlens_q, seqused_kv = self.impl._flash_attn_step_lengths(attn_metadata, 5)
-        self.assertTrue(torch.equal(cu_seqlens_q, torch.tensor([0, 3, 5, 5, 5], dtype=torch.int32)))
-        self.assertTrue(torch.equal(seqused_kv, torch.tensor([10, 20, 1, 1], dtype=torch.int32)))
+        self.assertTrue(torch.equal(cu_seqlens_q, torch.tensor([0, 3, 5], dtype=torch.int32)))
+        self.assertTrue(torch.equal(seqused_kv, torch.tensor([10, 20], dtype=torch.int32)))
+
+    def test_stale_tail_within_prefix_is_sanitized(self):
+        # A stale/negative slot *inside* the valid prefix is clamped and
+        # cummax-restored to monotonic; the padding beyond num_reqs is dropped.
+        attn_metadata = SimpleNamespace(
+            num_reqs=2,
+            query_start_loc_gpu=torch.tensor([0, 3, 5, -1, -1], dtype=torch.int32),
+            seq_lens_gpu=torch.tensor([10, 0], dtype=torch.int32),
+        )
+        cu_seqlens_q, seqused_kv = self.impl._flash_attn_step_lengths(attn_metadata, 5)
+        self.assertTrue(torch.equal(cu_seqlens_q, torch.tensor([0, 3, 5], dtype=torch.int32)))
+        self.assertTrue(torch.equal(seqused_kv, torch.tensor([10, 1], dtype=torch.int32)))
 
     def test_one_derivation_serves_every_layer(self):
         attn_metadata = SimpleNamespace(
+            num_reqs=2,
             query_start_loc_gpu=torch.tensor([0, 1, 2], dtype=torch.int32),
             seq_lens_gpu=torch.tensor([7, 9], dtype=torch.int32),
         )
@@ -181,14 +197,15 @@ class TestFlashAttnForward(TestBase):
         self.impl.key_cache = torch.zeros(4, 128, self.NUM_KV_HEADS, self.HEAD_SIZE)
         self.impl.value_cache = torch.zeros(4, 128, self.NUM_KV_HEADS, self.HEAD_SIZE)
 
-    def _forward(self, *, max_query_len, attn_mask=None):
+    def _forward(self, *, max_query_len, attn_mask=None, num_reqs=2, num_block_rows=2):
         attn_metadata = SimpleNamespace(
             causal=True,
             num_actual_tokens=self.NUM_TOKENS,
+            num_reqs=num_reqs,
             query_start_loc_gpu=torch.tensor([0, 3, 5], dtype=torch.int32),
             seq_lens_gpu=torch.tensor([10, 20], dtype=torch.int32),
             max_query_len=max_query_len,
-            block_tables=torch.zeros(2, 1, dtype=torch.int32),
+            block_tables=torch.zeros(num_block_rows, 1, dtype=torch.int32),
             attn_mask=attn_mask,
         )
         query = torch.randn(8, self.NUM_HEADS, self.HEAD_SIZE)  # padded past num_actual_tokens
@@ -228,6 +245,22 @@ class TestFlashAttnForward(TestBase):
         self.assertEqual(kwargs["mask_mode"], 3)
         self.assertIs(kwargs["attn_mask"], mask)
         self.assertEqual(kwargs["max_seqlen_q"], 3)
+
+    def test_decode_step_falls_back_to_single_row(self):
+        # max_query_len is None on decode; max_seqlen_q must become 1 (not the
+        # batch token total) so the step still hits the NO_MASK fast path.
+        _, seen = self._forward(max_query_len=None)
+        self.assertEqual(seen["kwargs"]["max_seqlen_q"], 1)
+        self.assertEqual(seen["kwargs"]["mask_mode"], 0)
+
+    def test_block_table_is_sliced_to_num_reqs(self):
+        # block_tables is a persistent max_num_reqs-row buffer; only num_reqs
+        # rows may reach the op so B stays aligned with cu_seqlens_q (B + 1).
+        _, seen = self._forward(max_query_len=1, num_reqs=2, num_block_rows=4)
+        block_table = seen["kwargs"]["block_table"]
+        self.assertEqual(block_table.shape[0], 2)
+        cu_seqlens_q = seen["kwargs"]["cu_seqlens_q"]
+        self.assertEqual(cu_seqlens_q.shape[0], 3)  # num_reqs + 1
 
     def test_non_int8_masks_are_converted(self):
         mask = torch.triu(torch.ones(2048, 2048), diagonal=1).to(torch.bool)

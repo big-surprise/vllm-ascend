@@ -130,13 +130,19 @@ class AscendFlashAttnImpl(AscendAttentionBackendImpl):
                 "AscendFlashAttnImpl requires the default PA_BBND paged KV cache layout. "
                 "Please unset VLLM_KV_CACHE_LAYOUT (LBHNC/HND) or use the default FIA backend."
             )
-        if get_flash_attn_ops() is None:
+        ops = get_flash_attn_ops()
+        if ops is None:
             raise ValueError(
                 "AscendFlashAttnImpl requires cann_ops_transformer with the "
                 "flash_attn and flash_attn_metadata APIs (Ascend 950PR/950DT "
                 "build). Please install a compatible cann_ops_transformer or "
                 "unset VLLM_ASCEND_ENABLE_FLASH_ATTN."
             )
+        # Cache the resolved operators once. forward_impl and the metadata
+        # derivation run inside the captured region, so re-resolving via
+        # find_spec/import_module on every replay is both wasteful and can
+        # re-trigger import side effects each step.
+        self._flash_attn_op, self._flash_attn_metadata_op = ops
 
     def _flash_attn_step_cache(self, attn_metadata: AscendMetadata) -> dict:
         cache = getattr(attn_metadata, "flash_attn_metadata_cache", None)
@@ -157,14 +163,25 @@ class AscendFlashAttnImpl(AscendAttentionBackendImpl):
         cache = self._flash_attn_step_cache(attn_metadata)
         lengths = cache.get("lengths")
         if lengths is None:
-            # Clamp sanitizes the tail: unused query_start_loc slots carry -1
-            # (FIA padding convention) and may hold stale entries from larger
-            # earlier steps; cummax restores monotonicity, turning the tail
-            # into zero-length requests. seq_lens clamp(min=1) matches the
-            # dummy-request convention (block 0, one token).
+            # The persistent buffers are sized for max_num_reqs (+ a padding
+            # slot for query_start_loc) and carry stale tail entries from
+            # larger earlier steps. Slice to the exact request count first so
+            # cu_seqlens_q has length num_reqs + 1 and seqused_kv length
+            # num_reqs, keeping them aligned with block_tables' num_reqs rows
+            # (the flash_attn op does not validate this alignment, see doc).
+            num_reqs = attn_metadata.num_reqs
+            # Clamp sanitizes the tail within the valid prefix: unused
+            # query_start_loc slots carry -1 (FIA padding convention) and may
+            # hold stale entries from larger earlier steps; cummax restores
+            # monotonicity, turning the tail into zero-length requests.
+            # seq_lens clamp(min=1) matches the dummy-request convention
+            # (block 0, one token).
             lengths = (
-                attn_metadata.query_start_loc_gpu.clamp(min=0, max=num_tokens).cummax(dim=0).values,
-                attn_metadata.seq_lens_gpu.clamp(min=1),
+                attn_metadata.query_start_loc_gpu[: num_reqs + 1]
+                .clamp(min=0, max=num_tokens)
+                .cummax(dim=0)
+                .values,
+                attn_metadata.seq_lens_gpu[:num_reqs].clamp(min=1),
             )
             cache["lengths"] = lengths
         return lengths
@@ -209,8 +226,7 @@ class AscendFlashAttnImpl(AscendAttentionBackendImpl):
             # TND + PA: pass cu_seqlens_q only; the KV side is addressed via
             # block_table + seqused_kv. batch_size must NOT be passed with a
             # TND layout_q.
-            _, metadata_op = get_flash_attn_ops()
-            metadata = metadata_op(
+            metadata = self._flash_attn_metadata_op(
                 self.num_heads,
                 self.num_kv_heads,
                 self.head_size,
@@ -267,7 +283,12 @@ class AscendFlashAttnImpl(AscendAttentionBackendImpl):
             )
         cu_seqlens_q, seqused_kv = self._flash_attn_step_lengths(attn_metadata, num_tokens)
         # The longest single query in the batch -- NOT the batch token total.
-        max_seqlen_q = attn_metadata.max_query_len or num_tokens
+        # max_query_len is None for decode steps (every request contributes
+        # one row), so fall back to 1 there: the previous `or num_tokens`
+        # inflated max_seqlen_q to the batch token total on decode, which
+        # (a) mislabels the step as prefill for the metadata plan and
+        # (b) permanently selected CAUSAL, losing the NO_MASK fast path.
+        max_seqlen_q = attn_metadata.max_query_len if attn_metadata.max_query_len is not None else 1
 
         # Drop the mask entirely when every request contributes a single
         # query row: at Q_S == 1 NO_MASK is exactly equivalent to CAUSAL
@@ -283,7 +304,13 @@ class AscendFlashAttnImpl(AscendAttentionBackendImpl):
             mask_mode=mask_mode,
         )
 
-        attention_op, _ = get_flash_attn_ops()
+        attention_op = self._flash_attn_op
+        # block_tables is a persistent buffer with max_num_reqs rows; slice it
+        # to the exact request count so its row count B matches cu_seqlens_q's
+        # length B + 1 (the flash_attn op treats block_table's row count as B
+        # and does not validate the alignment, so a stale tail would feed bogus
+        # block ids for the padding rows).
+        block_table = attn_metadata.block_tables[: attn_metadata.num_reqs]
         # The doc forbids attn_mask under NO_MASK and requires the fixed
         # 2048x2048 lower-triangular int8 mask under CAUSAL, so the two
         # travel together.
@@ -291,7 +318,7 @@ class AscendFlashAttnImpl(AscendAttentionBackendImpl):
             query,
             self.key_cache,
             self.value_cache,
-            block_table=attn_metadata.block_tables,
+            block_table=block_table,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_kv=None,
             seqused_q=None,
