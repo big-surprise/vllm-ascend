@@ -680,9 +680,13 @@ class AscendConfig:
     msmonitor_use_daemon: bool = False
     enable_transpose_kv_cache_by_block: bool = True
     weight_nz_mode: int = 1
-    # Opt-in load-time [K,N] NZ layout for Qwen3.5 dense BF16 FFN only.
+    # Opt-in load-time [K,N] NZ layout for Qwen3.5 dense BF16 FFN.
     # Keep weight_nz_mode=0: this differs from the generic [N,K] NZ layout.
     ffn_weight_layout: Literal["default", "nz_kn"] = "default"
+    # Independent, load-time layouts for the two validated attention inputs.
+    # Replace the Parameter storage once; no runtime token gate or duplicate cache.
+    linear_attention_qkvz_layout: Literal["default", "nz_kn"] = "default"
+    full_attention_qkv_layout: Literal["default", "nz_kn"] = "default"
     # Optional explicit bridge to the existing vLLM environment setting.
     # None preserves the environment; true/false explicitly overrides it.
     VLLM_ALLOW_INSECURE_SERIALIZATION: bool | None = None
@@ -760,7 +764,17 @@ class AscendConfig:
             clear_cache()
 
     def _validate_ffn_weight_layout(self, vc: VllmConfig) -> None:
-        if self.ffn_weight_layout == "nz_kn":
+        requested = [
+            name
+            for name in ("ffn_weight_layout", "linear_attention_qkvz_layout", "full_attention_qkv_layout")
+            if getattr(self, name, "default") == "nz_kn"
+        ]
+        if requested:
+            option = ", ".join(requested)
+            if getattr(self, "linear_attention_qkvz_layout", "default") == "nz_kn" and getattr(
+                self, "enable_gdn_qkv_split", False
+            ):
+                raise ValueError("linear_attention_qkvz_layout=nz_kn requires enable_gdn_qkv_split=false")
             model = vc.model_config
             text_config = getattr(model, "hf_text_config", None)
             if (
@@ -770,9 +784,9 @@ class AscendConfig:
                 or str(getattr(model, "dtype", None)) != "torch.bfloat16"
                 or getattr(model, "quantization", None) is not None
             ):
-                raise ValueError("ffn_weight_layout=nz_kn requires unquantized Qwen3.5 dense BF16")
+                raise ValueError(f"{option}=nz_kn requires unquantized Qwen3.5 dense BF16")
             if self.weight_nz_mode != 0:
-                raise ValueError("ffn_weight_layout=nz_kn requires weight_nz_mode=0")
+                raise ValueError(f"{option}=nz_kn requires weight_nz_mode=0")
             if (
                 self.rl_config.enabled
                 or vc.lora_config is not None
@@ -784,7 +798,7 @@ class AscendConfig:
                 or vc.parallel_config.decode_context_parallel_size > 1
             ):
                 raise ValueError(
-                    "ffn_weight_layout=nz_kn does not support LoRA, RL/weight transfer, "
+                    f"{option}=nz_kn does not support LoRA, RL/weight transfer, "
                     "sleep/offload or context-parallel weight switching"
                 )
 
