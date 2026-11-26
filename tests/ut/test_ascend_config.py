@@ -1225,9 +1225,9 @@ class TestSubconfigPydanticTypeValidation(TestBase):
             AscendFusionConfig(unknown_key=1)
 
     def test_enable_gdn_qkv_split_defaults_off(self):
-        self.assertFalse(AscendConfig().enable_gdn_qkv_split)
-        self.assertTrue(AscendConfig(enable_gdn_qkv_split="true").enable_gdn_qkv_split)
-        self.assertFalse(AscendConfig(enable_gdn_qkv_split="false").enable_gdn_qkv_split)
+        self.assertFalse(AscendConfig(sparse_kv_offload_config=None).enable_gdn_qkv_split)
+        self.assertTrue(AscendConfig(sparse_kv_offload_config=None, enable_gdn_qkv_split="true").enable_gdn_qkv_split)
+        self.assertFalse(AscendConfig(sparse_kv_offload_config=None, enable_gdn_qkv_split="false").enable_gdn_qkv_split)
 
     def test_ascend_fusion_config_gdn_gate_norm_defaults_off(self):
         self.assertFalse(AscendFusionConfig().fusion_ops_gdn_gate_norm)

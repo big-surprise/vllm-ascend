@@ -410,6 +410,11 @@ class MatmulAllReducePattern(_MatmulCommPattern):
                 return False
             if x_val.dim() != 2 or weight_val.dim() != 2:
                 return False
+            # The FFN [K,N] NZ base is exposed as a non-contiguous [N,K]
+            # view. Keep its matmul and reduction separate: the fused
+            # replacement does not support that packed operand contract.
+            if not weight_val.is_contiguous():
+                return False
             if x_val.dtype not in self._SUPPORTED_DTYPES or x_val.dtype is not weight_val.dtype:
                 return False
             return self._meets_min_tokens(x)
