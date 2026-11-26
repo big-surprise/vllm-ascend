@@ -12,7 +12,7 @@ from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from vllm_ascend.utils import get_weight_prefetch_method, is_950
+from vllm_ascend.utils import bootstrap_custom_op_env, get_weight_prefetch_method, is_950
 
 HEAD_DIM = 128
 CONV_HISTORY = 3
@@ -42,6 +42,7 @@ def prepare_mega_gdn_weights(layer: torch.nn.Module) -> None:
         return
     if layer.dt_bias.device.type == "npu":
         # Load only after device selection, before any graph capture.
+        bootstrap_custom_op_env(include_vendor_lib=True)
         import_module("vllm_ascend.vllm_ascend_C")
         if not hasattr(torch.ops._C_ascend, "mega_gdn_decode"):
             raise RuntimeError("Rebuild vllm_ascend_C to enable MegaGdnDecode")
