@@ -642,6 +642,12 @@ class AscendConfig:
     msmonitor_use_daemon: bool = False
     enable_transpose_kv_cache_by_block: bool = True
     weight_nz_mode: int = 1
+    # Opt-in load-time [K,N] NZ layout for Qwen3.5 dense BF16 FFN only.
+    # Keep weight_nz_mode=0: this differs from the generic [N,K] NZ layout.
+    ffn_weight_layout: Literal["default", "nz_kn"] = "default"
+    # Optional explicit bridge to the existing vLLM environment setting.
+    # None preserves the environment; true/false explicitly overrides it.
+    VLLM_ALLOW_INSECURE_SERIALIZATION: bool | None = None
 
     # ---- sub-configs (no vllm_config dep): pydantic dict→dataclass coercion ----
     ascend_compilation_config: AscendCompilationConfig = dataclasses.field(default_factory=AscendCompilationConfig)
@@ -703,6 +709,47 @@ class AscendConfig:
             self.enable_fused_mc2 = 1
         return self
 
+    def _apply_serialization_setting(self) -> None:
+        value = self.VLLM_ALLOW_INSECURE_SERIALIZATION
+        if value is None:
+            return
+        # Lazy import preserves config/platform discovery initialization order.
+        from vllm import envs as vllm_envs
+
+        os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1" if value else "0"
+        clear_cache = getattr(vllm_envs.__getattr__, "cache_clear", None)
+        if clear_cache is not None:
+            clear_cache()
+
+    def _validate_ffn_weight_layout(self, vc: VllmConfig) -> None:
+        if self.ffn_weight_layout == "nz_kn":
+            model = vc.model_config
+            text_config = getattr(model, "hf_text_config", None)
+            if (
+                model is None
+                or getattr(text_config, "model_type", None) != "qwen3_5_text"
+                or getattr(model, "is_moe", False)
+                or str(getattr(model, "dtype", None)) != "torch.bfloat16"
+                or getattr(model, "quantization", None) is not None
+            ):
+                raise ValueError("ffn_weight_layout=nz_kn requires unquantized Qwen3.5 dense BF16")
+            if self.weight_nz_mode != 0:
+                raise ValueError("ffn_weight_layout=nz_kn requires weight_nz_mode=0")
+            if (
+                self.rl_config.enabled
+                or vc.lora_config is not None
+                or getattr(vc, "weight_transfer_config", None) is not None
+                or getattr(model, "enable_sleep_mode", False)
+                or getattr(vc.cache_config, "cpu_offload_gb", 0) > 0
+                or getattr(vc.cache_config, "offload_group_size", 0) > 0
+                or vc.parallel_config.prefill_context_parallel_size > 1
+                or vc.parallel_config.decode_context_parallel_size > 1
+            ):
+                raise ValueError(
+                    "ffn_weight_layout=nz_kn does not support LoRA, RL/weight transfer, "
+                    "sleep/offload or context-parallel weight switching"
+                )
+
     # ---- derivations + cross-config downgrades/mutex ----
     # Business validation: invoked explicitly by init_ascend_config (NOT a
     # pydantic after-validator). Preserves the original __init__ ordering —
@@ -710,6 +757,7 @@ class AscendConfig:
     # the max_num_batched_tokens that sequence-parallel writeback corrected).
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
+        self._validate_ffn_weight_layout(vc)
         engram_config = getattr(vc, "engram_config", None)
         if (
             engram_config is not None
@@ -1898,6 +1946,7 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
         and _is_ascend_config_initialized(_ASCEND_CONFIG)
         and _INIT_VLLM_CONFIG is vllm_config
     ):
+        _ASCEND_CONFIG._apply_serialization_setting()
         return _ASCEND_CONFIG
 
     # Pre-construct sub-configs that need precedence resolution or vllm_config.
@@ -2000,6 +2049,7 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
     new_config.rl_config.apply(new_config)
     new_config.finegrained_tp_config._validate_preconditions(vllm_config)
     new_config.xlite_graph_config._validate_preconditions(vllm_config)
+    new_config._apply_serialization_setting()
     if _is_ascend_config_initialized(new_config):
         _ASCEND_CONFIG = new_config
         _INIT_VLLM_CONFIG = vllm_config

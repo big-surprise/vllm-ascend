@@ -50,6 +50,7 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.logger import logger
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.models.common.ops.sequence_parallel import sp_reduce_scatter
+from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.parallel_state import (
     get_mlp_tp_group,
     get_otp_group,
@@ -175,7 +176,12 @@ class MatmulAllreduceRowParallelOp(CustomRowParallelOp):
         """
         from vllm_ascend.ops.mlp_weight_prefetch import ALLREDUCE_NORM_FUSE_THRESHOLD
 
-        if self.reduce_results and self.tp_size > 1 and input_parallel.shape[0] >= ALLREDUCE_NORM_FUSE_THRESHOLD:
+        if (
+            self.reduce_results
+            and self.tp_size > 1
+            and input_parallel.shape[0] >= ALLREDUCE_NORM_FUSE_THRESHOLD
+            and not getattr(self.layer, "_ascend_ffn_nz_transposed", False)
+        ):
             return DeviceOperator.npu_mm_all_reduce_base(
                 input_parallel,
                 self.layer.weight.t(),
