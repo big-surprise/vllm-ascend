@@ -41,6 +41,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm_ascend.device.hardware_profile import HardwareCapability, WeightLayoutPolicy, get_current_hardware_profile
+from vllm_ascend.ops.attention_weight_layout import maybe_prepare_attention_nz_weight
 from vllm_ascend.ops.ffn_weight_layout import maybe_prepare_ffn_nz_weight
 from vllm_ascend.ops.linear_op import get_parallel_op, get_replicated_op
 from vllm_ascend.utils import maybe_trans_nz
@@ -118,7 +119,7 @@ class AscendUnquantizedLinearMethod(WeightSwitchMixin, UnquantizedLinearMethod):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         super().process_weights_after_loading(layer)
-        if maybe_prepare_ffn_nz_weight(layer):
+        if maybe_prepare_ffn_nz_weight(layer) or maybe_prepare_attention_nz_weight(layer):
             # No generic NZ conversion may run after the transposed layout.
             self.supports_weight_switch = False
             return
