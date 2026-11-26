@@ -55,6 +55,8 @@ from vllm_ascend.ops.mega_gdn_decode import (
 from vllm_ascend.ops.shared_quant_proj import project_with_shared_quant
 from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
+from vllm_ascend.ops.triton.fla.split_decode_qkv import split_decode_qkv
+from vllm_ascend.ops.triton.fla.split_gdn_projection import split_gdn_projection
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.fused_gdn_gating_l2norm import (
     fused_gdn_gating_l2norm,
@@ -261,10 +263,13 @@ def _rearrange_decode_qkv(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Expose contiguous token-major Q/K/V without an intermediate concat.
 
-    Multi-token split views can have gaps between rows, so each component
-    still needs its own contiguous buffer. Single-token views need no copy.
+    Multi-token split views can have gaps between rows, so copy the three
+    components into contiguous buffers in one launch. Single-token views
+    need no copy.
     """
     num_tokens = mixed_qkv.shape[0]
+    if num_tokens > 1 and mixed_qkv.device.type == "npu":
+        return split_decode_qkv(mixed_qkv, key_dim, value_dim, head_k_dim, head_v_dim)
     query, key, value = mixed_qkv.split((key_dim, key_dim, value_dim), dim=-1)
     return (
         query.contiguous().view(1, num_tokens, key_dim // head_k_dim, head_k_dim),
@@ -458,12 +463,19 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 num_tokens = mixed_qkvz.size(0)
                 qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
                 z_size = self.value_dim // self.tp_size
-                mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
-                z = z.reshape(z.size(0), -1, self.head_v_dim)
-                b, a = self._split_ba_for_tp(ba)
-
-                b = b.contiguous()
-                a = a.contiguous()
+                if (
+                    mixed_qkvz.device.type == "npu"
+                    and mixed_qkvz.stride(-1) == 1
+                    and ba.stride(-1) == 1
+                    and not (self.disable_tp_for_ba_proj and self.tp_size > 1)
+                ):
+                    mixed_qkv, z, b, a = split_gdn_projection(mixed_qkvz, ba, qkv_size, z_size, self.head_v_dim)
+                else:
+                    mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
+                    z = z.reshape(z.size(0), -1, self.head_v_dim)
+                    b, a = self._split_ba_for_tp(ba)
+                    b = b.contiguous()
+                    a = a.contiguous()
             else:
                 projected_states_qkvz, projected_states_ba = project_with_shared_quant(
                     self, hidden_states, ("in_proj_qkvz", "in_proj_ba"), sp_num_tokens
@@ -482,9 +494,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Part 2: Core Attention (Custom Op)
         # ============================================================
-        # Note: we should not use torch.empty here like other attention backends,
-        # see discussions in https://github.com/vllm-project/vllm/pull/28182
-        core_attn_out = torch.zeros(
+        # The core writes every actual row. Its padded suffix is initialized
+        # inside the core op, where the runtime token count is available.
+        core_attn_out = torch.empty(
             (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
             dtype=hidden_states.dtype,
             device=hidden_states.device,
@@ -567,6 +579,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         if attn_metadata is None:
             # V1 profile run
+            core_attn_out.zero_()
             return
 
         # Layerwise KV pool hooks must stay inside the custom op body: the
@@ -588,6 +601,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         self_kv_cache = self.kv_cache
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
+        if num_actual_tokens < core_attn_out.shape[0]:
+            core_attn_out[num_actual_tokens:].zero_()
 
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         b = b[:num_actual_tokens]

@@ -32,6 +32,15 @@ setup_catlass_dependency() {
     log "catlass include=${absolute_catlass_path}"
 }
 
+setup_pto_dependency() {
+    local pto_header="${ROOT_DIR}/csrc/third_party/pto-isa/include/pto/pto-inst.hpp"
+    if [[ ! -f "${pto_header}" ]]; then
+        log "initializing PTO ISA submodule"
+        git -C "${ROOT_DIR}" submodule update --init csrc/third_party/pto-isa || exit 1
+    fi
+    [[ -f "${pto_header}" ]] || { log "PTO ISA header is missing: ${pto_header}"; exit 1; }
+}
+
 resolve_op_dir() {
     local op_name=$1
     local candidate_dir
@@ -197,6 +206,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
     # ASCEND950 (A5) series
     # dependency: catlass
     setup_catlass_dependency
+    setup_pto_dependency
 
     CUSTOM_OPS_ARRAY=(
         "sparse_flash_attention"
@@ -226,6 +236,9 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "k2q_csr"
         "sparse_attention_score"
         "msa_index_score"
+        "mega_gdn_decode"
+        "mega_gdn_decode_strided"
+        "mega_gdn_decode_strided_batch"
     )
 
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
