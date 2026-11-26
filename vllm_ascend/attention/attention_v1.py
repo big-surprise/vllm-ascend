@@ -236,6 +236,13 @@ class AscendMetadata:
     # for. Only used on the eager path -- graph capture bypasses the cache so
     # the metadata op executes inside the captured region.
     qfa_metadata_cache: dict = field(default_factory=dict)
+    # Per-step scratch for non-quantized CANN flash_attn layers. One
+    # AscendMetadata is built per step and shared by all attention layers, so
+    # the metadata plan, length derivation, scalars, int8 mask and sliced
+    # block table are computed once by the first full-attention layer and
+    # reused by the rest. Keys: "lengths", "scalars", "attn_mask",
+    # "block_table", and the plan-key tuple.
+    flash_attn_metadata_cache: dict = field(default_factory=dict)
     pcp_local_num_input_tokens: int | None = None
 
 

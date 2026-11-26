@@ -61,6 +61,10 @@ FLASH_ATTN_LAYOUT_PA_BBND = "PA_BBND"
 # non-quantized interface (QK and V head dims must match here).
 FLASH_ATTN_SUPPORTED_HEAD_DIMS = (64, 72, 128, 256)
 
+# cache.get() sentinel for "not derived yet" -- distinct from None, which is
+# itself a valid attn_mask value on the NO_MASK path.
+_MASK_NOT_COMPUTED = object()
+
 
 def get_flash_attn_ops() -> tuple | None:
     """Find the two flash_attn APIs in the active CANN operator package.
@@ -145,6 +149,14 @@ class AscendFlashAttnImpl(AscendAttentionBackendImpl):
         self._flash_attn_op, self._flash_attn_metadata_op = ops
 
     def _flash_attn_step_cache(self, attn_metadata: AscendMetadata) -> dict:
+        """The step-wide scratch shared by every full-attention layer.
+
+        ``AscendMetadata`` declares ``flash_attn_metadata_cache`` as a field,
+        and the builder builds one metadata per step shared by all layers, so
+        any per-step derivation stored here is computed once and consumed by
+        every layer. The getattr fallback keeps hand-built metadata objects
+        (e.g. unit-test namespaces) working without the schema field.
+        """
         cache = getattr(attn_metadata, "flash_attn_metadata_cache", None)
         if cache is None:
             cache = {}
@@ -186,14 +198,60 @@ class AscendFlashAttnImpl(AscendAttentionBackendImpl):
             cache["lengths"] = lengths
         return lengths
 
+    def _flash_attn_step_scalars(self, attn_metadata: AscendMetadata) -> tuple[int, int]:
+        """Return (max_seqlen_q, mask_mode), derived once per step.
+
+        max_query_len is None for decode steps (every request contributes one
+        row), so fall back to 1 there: inflating it to the batch token total
+        would mislabel the step as prefill for the metadata plan and force the
+        expensive CAUSAL kernel. Drop the mask entirely at Q_S == 1, where
+        NO_MASK is equivalent (seqused_kv bounds each KV range); MTP verify
+        steps (Q_S = 1 + num_spec) keep CAUSAL.
+        """
+        cache = self._flash_attn_step_cache(attn_metadata)
+        scalars = cache.get("scalars")
+        if scalars is None:
+            max_seqlen_q = attn_metadata.max_query_len if attn_metadata.max_query_len is not None else 1
+            mask_mode = (
+                FLASH_ATTN_MASK_MODE_NO_MASK if max_seqlen_q == 1 else FLASH_ATTN_MASK_MODE_CAUSAL
+            )
+            scalars = cache["scalars"] = (max_seqlen_q, mask_mode)
+        return scalars
+
     def _flash_attn_int8_mask(self, attn_metadata: AscendMetadata) -> torch.Tensor | None:
-        """flash_attn's attn_mask is INT8; the shared builder already hands
-        out an int8 causal mask, so only convert other sources."""
-        if attn_metadata.attn_mask is None:
+        """flash_attn's attn_mask is INT8, derived once per step.
+
+        The shared builder already hands out an int8 causal mask, so the
+        common case is just an identity; but a non-int8 source is converted
+        once here and the result cached so every layer consumes the same
+        tensor. Stored under a sentinel that is distinct from any plan key.
+        """
+        cache = self._flash_attn_step_cache(attn_metadata)
+        mask = cache.get("attn_mask", _MASK_NOT_COMPUTED)
+        if mask is _MASK_NOT_COMPUTED:
+            mask = cache["attn_mask"] = self._convert_int8_mask(attn_metadata.attn_mask)
+        return mask
+
+    @staticmethod
+    def _convert_int8_mask(mask: torch.Tensor | None) -> torch.Tensor | None:
+        if mask is None:
             return None
-        if attn_metadata.attn_mask.dtype == torch.int8:
-            return attn_metadata.attn_mask
-        return attn_metadata.attn_mask.to(torch.int8)
+        return mask if mask.dtype == torch.int8 else mask.to(torch.int8)
+
+    def _flash_attn_block_table(self, attn_metadata: AscendMetadata) -> torch.Tensor:
+        """Return this step's block table sliced to num_reqs, derived once.
+
+        block_tables is a persistent max_num_reqs-row buffer; slicing to the
+        exact request count keeps its row count B aligned with cu_seqlens_q's
+        length B + 1 (the op treats block_table's row count as B and does not
+        validate the alignment, so a stale tail would feed bogus block ids).
+        The slice is a view, so sharing it by identity across layers is safe.
+        """
+        cache = self._flash_attn_step_cache(attn_metadata)
+        block_table = cache.get("block_table")
+        if block_table is None:
+            block_table = cache["block_table"] = attn_metadata.block_tables[: attn_metadata.num_reqs]
+        return block_table
 
     def _get_flash_attn_metadata(
         self,
@@ -282,19 +340,7 @@ class AscendFlashAttnImpl(AscendAttentionBackendImpl):
                 "(query_start_loc_gpu / seq_lens_gpu) on AscendMetadata."
             )
         cu_seqlens_q, seqused_kv = self._flash_attn_step_lengths(attn_metadata, num_tokens)
-        # The longest single query in the batch -- NOT the batch token total.
-        # max_query_len is None for decode steps (every request contributes
-        # one row), so fall back to 1 there: the previous `or num_tokens`
-        # inflated max_seqlen_q to the batch token total on decode, which
-        # (a) mislabels the step as prefill for the metadata plan and
-        # (b) permanently selected CAUSAL, losing the NO_MASK fast path.
-        max_seqlen_q = attn_metadata.max_query_len if attn_metadata.max_query_len is not None else 1
-
-        # Drop the mask entirely when every request contributes a single
-        # query row: at Q_S == 1 NO_MASK is exactly equivalent to CAUSAL
-        # (the KV range is bounded by seqused_kv) and picks a cheaper kernel.
-        # MTP verify steps (Q_S = 1 + num_spec) keep CAUSAL.
-        mask_mode = FLASH_ATTN_MASK_MODE_NO_MASK if max_seqlen_q == 1 else FLASH_ATTN_MASK_MODE_CAUSAL
+        max_seqlen_q, mask_mode = self._flash_attn_step_scalars(attn_metadata)
 
         fa_metadata = self._get_flash_attn_metadata(
             attn_metadata,
@@ -305,12 +351,7 @@ class AscendFlashAttnImpl(AscendAttentionBackendImpl):
         )
 
         attention_op = self._flash_attn_op
-        # block_tables is a persistent buffer with max_num_reqs rows; slice it
-        # to the exact request count so its row count B matches cu_seqlens_q's
-        # length B + 1 (the flash_attn op treats block_table's row count as B
-        # and does not validate the alignment, so a stale tail would feed bogus
-        # block ids for the padding rows).
-        block_table = attn_metadata.block_tables[: attn_metadata.num_reqs]
+        block_table = self._flash_attn_block_table(attn_metadata)
         # The doc forbids attn_mask under NO_MASK and requires the fixed
         # 2048x2048 lower-triangular int8 mask under CAUSAL, so the two
         # travel together.

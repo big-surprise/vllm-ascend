@@ -66,13 +66,32 @@ class TestFlashAttnBackend(TestBase):
         self.assertEqual(AscendFlashAttnBackend.get_supported_kernel_block_sizes(), [128])
 
 
+def _bare_impl(*, num_heads=8, num_kv_heads=2, head_size=128):
+    """Build an impl without running __init__ (no vllm/torch_npu needed).
+
+    P5 caches the resolved operators on the instance in __init__, so tests
+    that bypass __init__ must install the two op attributes by hand.
+    """
+    impl = object.__new__(AscendFlashAttnImpl)
+    impl.num_heads = num_heads
+    impl.num_kv_heads = num_kv_heads
+    impl.head_size = head_size
+    impl.scale = 1.0 / (head_size**0.5)
+    impl.sinks = None
+    impl.key_cache = torch.zeros(4, 128, num_kv_heads, head_size)
+    impl.value_cache = torch.zeros(4, 128, num_kv_heads, head_size)
+    impl._flash_attn_op = MagicMock()
+    impl._flash_attn_metadata_op = MagicMock()
+    return impl
+
+
 class TestFlashAttnStepLengths(TestBase):
     """cu_seqlens_q / seqused_kv are derived once a step and shared by
     every full-attention layer; the sanitize clamp turns padded tails into
     zero-length requests."""
 
     def setUp(self):
-        self.impl = object.__new__(AscendFlashAttnImpl)
+        self.impl = _bare_impl()
 
     def test_derivation_matches_the_tnd_contract(self):
         # num_reqs slices the persistent buffers down to the valid prefix, so
@@ -110,6 +129,25 @@ class TestFlashAttnStepLengths(TestBase):
         self.assertIs(first[1], second[1])
 
 
+class TestFlashAttnStepScalars(TestBase):
+    """max_seqlen_q / mask_mode are derived once and shared."""
+
+    def setUp(self):
+        self.impl = _bare_impl()
+
+    def test_decode_falls_back_to_single_row_and_no_mask(self):
+        scalars = self.impl._flash_attn_step_scalars(SimpleNamespace(max_query_len=None))
+        self.assertEqual(scalars, (1, 0))
+
+    def test_prefill_keeps_causal_mask(self):
+        scalars = self.impl._flash_attn_step_scalars(SimpleNamespace(max_query_len=7))
+        self.assertEqual(scalars, (7, 3))
+
+    def test_scalars_are_cached_by_identity(self):
+        md = SimpleNamespace(max_query_len=7)
+        self.assertIs(self.impl._flash_attn_step_scalars(md), self.impl._flash_attn_step_scalars(md))
+
+
 class TestFlashAttnMetadataPlan(TestBase):
     """One metadata plan a step, capture included.
 
@@ -120,13 +158,10 @@ class TestFlashAttnMetadataPlan(TestBase):
     AICore-to-AICPU round trip.
     """
 
-    LAYERS_PER_STEP = 48  # Qwen3.5-27B full-attention layer count ballpark
+    LAYERS_PER_STEP = 16  # Qwen3.5-27B full-attention layer count
 
     def setUp(self):
-        self.impl = object.__new__(AscendFlashAttnImpl)
-        self.impl.num_heads = 8
-        self.impl.num_kv_heads = 2
-        self.impl.head_size = 128
+        self.impl = _bare_impl()
 
     def _plans(self, calls):
         """Issue one step's worth of plans; return (plans, operator calls)."""
@@ -137,18 +172,14 @@ class TestFlashAttnMetadataPlan(TestBase):
             invocations.append((args, kwargs))
             return MagicMock()
 
+        self.impl._flash_attn_metadata_op = metadata_op
         defaults = {
             "cu_seqlens_q": torch.tensor([0, 1, 2], dtype=torch.int32),
             "seqused_kv": torch.tensor([10, 20], dtype=torch.int32),
             "max_seqlen_q": 1,
             "mask_mode": 0,
         }
-        ops_module = MagicMock(flash_attn=MagicMock(), flash_attn_metadata=metadata_op)
-        with (
-            patch("vllm_ascend.attention.flash_attn_v1.find_spec", return_value=MagicMock()),
-            patch.dict("sys.modules", {"cann_ops_transformer.ops": ops_module}),
-        ):
-            plans = [self.impl._get_flash_attn_metadata(attn_metadata, **{**defaults, **call}) for call in calls]
+        plans = [self.impl._get_flash_attn_metadata(attn_metadata, **{**defaults, **call}) for call in calls]
         return plans, invocations
 
     def test_one_plan_serves_every_layer(self):
@@ -179,6 +210,98 @@ class TestFlashAttnMetadataPlan(TestBase):
         self.assertEqual(kwargs["win_right"], -1)
 
 
+class TestFlashAttnCrossLayerReuse(TestBase):
+    """The real object model: every layer owns a distinct impl instance, but
+    the builder produces ONE AscendMetadata per step shared by all layers.
+
+    Each per-step derivation -- lengths, scalars, int8 mask, block-table slice
+    and the metadata plan -- must be computed once by the first full-attention
+    layer and consumed by identity by all the others. This is what makes the
+    FlashAttnMetadata op appear once per step instead of once per layer.
+    """
+
+    NUM_FULL_ATTN_LAYERS = 16  # Qwen3.5-27B: 64 layers, 16 full-attention
+
+    def setUp(self):
+        self.metadata_invocations = []
+        self.attention_kwargs = []
+
+        def metadata_op(*args, **kwargs):
+            self.metadata_invocations.append((args, kwargs))
+            return MagicMock(name="fa_plan")
+
+        def attention_op(*args, **kwargs):
+            self.attention_kwargs.append(kwargs)
+            return torch.ones(5, 8, 128), torch.empty(1)
+
+        self.metadata_op = metadata_op
+        self.attention_op = attention_op
+
+    def _new_layer_impl(self):
+        impl = _bare_impl()
+        impl._flash_attn_op = self.attention_op
+        impl._flash_attn_metadata_op = self.metadata_op
+        return impl
+
+    def _shared_step_metadata(self, *, max_query_len=3, mask_is_int8=True):
+        mask = torch.triu(torch.ones(2048, 2048), diagonal=1)
+        mask = mask.to(torch.int8) if mask_is_int8 else mask.to(torch.bool)
+        return SimpleNamespace(
+            causal=True,
+            num_actual_tokens=5,
+            num_reqs=2,
+            query_start_loc_gpu=torch.tensor([0, 3, 5], dtype=torch.int32),
+            seq_lens_gpu=torch.tensor([10, 20], dtype=torch.int32),
+            max_query_len=max_query_len,
+            block_tables=torch.zeros(4, 1, dtype=torch.int32),
+            attn_mask=mask,
+            flash_attn_metadata_cache={},
+        )
+
+    def _run_all_layers(self, md):
+        for _ in range(self.NUM_FULL_ATTN_LAYERS):
+            impl = self._new_layer_impl()
+            output = torch.zeros(5, 8, 128)
+            impl.forward_impl(torch.randn(5, 8, 128), None, None, None, md, output)
+
+    def test_all_layers_share_one_metadata_op_call(self):
+        md = self._shared_step_metadata()
+        self._run_all_layers(md)
+        self.assertEqual(len(self.metadata_invocations), 1)
+
+    def test_all_layers_consume_the_same_derived_tensors(self):
+        md = self._shared_step_metadata()
+        self._run_all_layers(md)
+        self.assertEqual(len(self.attention_kwargs), self.NUM_FULL_ATTN_LAYERS)
+        first = self.attention_kwargs[0]
+        for key in ("metadata", "cu_seqlens_q", "seqused_kv", "block_table", "attn_mask"):
+            for kwargs in self.attention_kwargs[1:]:
+                self.assertIs(kwargs[key], first[key], f"{key} not shared across layers")
+
+    def test_non_int8_mask_is_converted_once_and_shared(self):
+        md = self._shared_step_metadata(mask_is_int8=False)
+        self._run_all_layers(md)
+        first_mask = self.attention_kwargs[0]["attn_mask"]
+        self.assertEqual(first_mask.dtype, torch.int8)
+        self.assertIsNot(first_mask, md.attn_mask)  # a conversion happened
+        for kwargs in self.attention_kwargs[1:]:
+            self.assertIs(kwargs["attn_mask"], first_mask)
+
+    def test_block_table_is_sliced_once_to_num_reqs(self):
+        md = self._shared_step_metadata()
+        self._run_all_layers(md)
+        block_table = self.attention_kwargs[0]["block_table"]
+        self.assertEqual(block_table.shape[0], md.num_reqs)
+        self.assertIs(block_table, md.flash_attn_metadata_cache["block_table"])
+
+    def test_decode_step_drops_mask_everywhere(self):
+        md = self._shared_step_metadata(max_query_len=None)
+        self._run_all_layers(md)
+        self.assertEqual(self.metadata_invocations[0][1]["mask_mode"], 0)
+        for kwargs in self.attention_kwargs:
+            self.assertIsNone(kwargs["attn_mask"])
+
+
 class TestFlashAttnForward(TestBase):
     """forward_impl drives one flash_attn call over the paged cache."""
 
@@ -188,14 +311,7 @@ class TestFlashAttnForward(TestBase):
     NUM_TOKENS = 5
 
     def setUp(self):
-        self.impl = object.__new__(AscendFlashAttnImpl)
-        self.impl.num_heads = self.NUM_HEADS
-        self.impl.num_kv_heads = self.NUM_KV_HEADS
-        self.impl.head_size = self.HEAD_SIZE
-        self.impl.scale = 1.0 / (self.HEAD_SIZE**0.5)
-        self.impl.sinks = None
-        self.impl.key_cache = torch.zeros(4, 128, self.NUM_KV_HEADS, self.HEAD_SIZE)
-        self.impl.value_cache = torch.zeros(4, 128, self.NUM_KV_HEADS, self.HEAD_SIZE)
+        self.impl = _bare_impl()
 
     def _forward(self, *, max_query_len, attn_mask=None, num_reqs=2, num_block_rows=2):
         attn_metadata = SimpleNamespace(
@@ -217,12 +333,8 @@ class TestFlashAttnForward(TestBase):
             seen["kwargs"] = kwargs
             return torch.ones(self.NUM_TOKENS, self.NUM_HEADS, self.HEAD_SIZE), torch.empty(1)
 
-        ops_module = MagicMock(flash_attn=attention_op, flash_attn_metadata=MagicMock(return_value=MagicMock()))
-        with (
-            patch("vllm_ascend.attention.flash_attn_v1.find_spec", return_value=MagicMock()),
-            patch.dict("sys.modules", {"cann_ops_transformer.ops": ops_module}),
-        ):
-            result = self.impl.forward_impl(query, None, None, None, attn_metadata, output)
+        self.impl._flash_attn_op = attention_op
+        result = self.impl.forward_impl(query, None, None, None, attn_metadata, output)
         return result, seen
 
     def test_single_row_queries_drop_the_mask(self):
