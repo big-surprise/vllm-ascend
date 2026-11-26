@@ -178,6 +178,12 @@ class AscendMetadata:
     num_decode_tokens: int = 0
     num_prefills: int = 0
     num_decodes: int = 0
+    # Number of requests (sequences) seen by attention, including any dummy
+    # request appended to cover graph-padding query rows. Flash Attention
+    # needs cu_seqlens_q length num_reqs + 1, seqused_kv length num_reqs and
+    # block_tables num_reqs rows. Its KV length buffer may be shorter than
+    # num_reqs when a dummy request is appended at max_num_reqs.
+    num_reqs: int = 0
 
     # The sequence length per sequence. Sequence length means the computed
     # tokens + new tokens (is None if it is a decoding).
@@ -408,6 +414,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         attn_metadata = self.metadata_cls(
             num_actual_tokens=num_actual_tokens,
             num_decode_tokens=num_decode_tokens,
+            num_reqs=num_reqs,
             block_tables=block_table,
             query_start_loc=query_start_loc,
             query_start_loc_gpu=common_attn_metadata.query_start_loc,

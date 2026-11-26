@@ -18,6 +18,7 @@
 import torch
 import torch.distributed as dist
 from vllm.distributed.device_communicators.base_device_communicator import DeviceCommunicatorBase
+from vllm.logger import logger
 
 
 class _NpuAll2AllManager:
@@ -60,3 +61,49 @@ class NPUCommunicator(DeviceCommunicatorBase):
         # FlashInfer PCIe IPC backend on NPU.
         self.fi_pcie_ipc_ar_comm = None
         self.all2all_manager = _NpuAll2AllManager()
+
+        # Opt-in out-of-place all-reduce fast path
+        # (--additional-config '{"allreduce_outplace": true}', off by default).
+        # The default path reduces in place; the fast path issues a direct
+        # HcclAllReduce into a fresh receive buffer on the process group's
+        # borrowed communicator/collective stream. See hccl_outplace_ar.py.
+        self.oop_all_reduce = None
+        if self.world_size > 1 and _allreduce_outplace_requested():
+            from vllm_ascend.distributed.device_communicators.hccl_outplace_ar import (
+                HcclOutOfPlaceAllReduce,
+            )
+
+            # HCCL communicator lookup is indexed by the group-local rank,
+            # not the global rank (they differ when the group is not world).
+            self.oop_all_reduce = HcclOutOfPlaceAllReduce.build(
+                group=self.device_group,
+                device=self.device,
+                rank_in_group=self.rank_in_group,
+            )
+
+    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        # Per-call eligibility keeps unusual dtypes/layouts on the default
+        # in-place path instead of failing the request.
+        if self.oop_all_reduce is not None and self.oop_all_reduce.accepts(input_):
+            return self.oop_all_reduce.all_reduce(input_)
+        return super().all_reduce(input_)
+
+    def destroy(self) -> None:
+        if self.oop_all_reduce is not None:
+            self.oop_all_reduce.shutdown()
+            self.oop_all_reduce = None
+        super().destroy()
+
+
+def _allreduce_outplace_requested() -> bool:
+    """Defensive read: the Ascend config may not be initialised yet when the
+    communicator is constructed, and "config unavailable" must mean "off"."""
+    try:
+        from vllm_ascend.ascend_config import get_ascend_config
+
+        return bool(get_ascend_config().allreduce_outplace)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning_once(
+            "allreduce_outplace stays disabled: Ascend config unreadable (%s).", exc
+        )
+        return False
