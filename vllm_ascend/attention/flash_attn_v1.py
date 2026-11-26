@@ -39,7 +39,10 @@ from importlib import import_module
 from importlib.util import find_spec
 
 import torch
+from vllm.logger import logger
 
+from vllm_ascend import envs
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
     AscendAttentionBackendImpl,
@@ -60,6 +63,41 @@ FLASH_ATTN_LAYOUT_PA_BBND = "PA_BBND"
 # The operator doc restricts D to 64/72/128/256 for the shared-KV
 # non-quantized interface (QK and V head dims must match here).
 FLASH_ATTN_SUPPORTED_HEAD_DIMS = (64, 72, 128, 256)
+
+_FLASH_ATTN_DEBUG_PREFIX = "[FLASH_ATTN_DEBUG]"
+# Values printed per tensor in a debug record; the length tensors are one
+# entry per request, so this only bites on very large batches.
+_FLASH_ATTN_DEBUG_MAX_VALUES = 256
+
+# Steps dumped so far in this process, shared across every layer (each layer
+# owns its own impl instance). Guarded by the env cap, see
+# VLLM_ASCEND_FLASH_ATTN_DEBUG.
+_flash_attn_debug_records = 0
+# Memoized VLLM_ASCEND_FLASH_ATTN_DEBUG. The gate is evaluated on every layer
+# of every step, so the env lookup is resolved once; the variable is expected
+# to be set before launch, and toggling it needs a restart.
+_flash_attn_debug_limit: int | None = None
+
+
+def _debug_limit() -> int:
+    global _flash_attn_debug_limit
+    if _flash_attn_debug_limit is None:
+        _flash_attn_debug_limit = envs.VLLM_ASCEND_FLASH_ATTN_DEBUG
+    return _flash_attn_debug_limit
+
+
+def _debug_tensor_str(tensor: torch.Tensor | None, with_values: bool) -> str:
+    """Render a tensor operand as shape/dtype, plus values when it is cheap."""
+    if tensor is None:
+        return "None"
+    desc = f"shape={tuple(tensor.shape)} dtype={tensor.dtype}"
+    if not with_values:
+        return f"{desc} values=skipped(capture)"
+    flat = tensor.reshape(-1)
+    shown = [str(v) for v in flat[:_FLASH_ATTN_DEBUG_MAX_VALUES].tolist()]
+    if flat.numel() > _FLASH_ATTN_DEBUG_MAX_VALUES:
+        shown.append(f"...(+{flat.numel() - _FLASH_ATTN_DEBUG_MAX_VALUES})")
+    return f"{desc} values=[{', '.join(shown)}]"
 
 
 def get_flash_attn_ops() -> tuple | None:
@@ -246,6 +284,66 @@ class AscendFlashAttnImpl(AscendAttentionBackendImpl):
             cache[plan_key] = metadata
         return metadata
 
+    def _dump_flash_attn_args(
+        self,
+        attn_metadata: AscendMetadata,
+        *,
+        query: torch.Tensor,
+        cu_seqlens_q: torch.Tensor | None,
+        cu_seqlens_kv: torch.Tensor | None,
+        seqused_q: torch.Tensor | None,
+        seqused_kv: torch.Tensor | None,
+        mask_mode: int,
+        max_seqlen_q: int,
+        max_seqlen_kv: int,
+        block_table: torch.Tensor,
+    ) -> None:
+        """Log one flash_attn argument record per step when debug is enabled.
+
+        The record is emitted by the step's first full-attention layer and the
+        metadata object marks the step as done, so the remaining layers neither
+        re-sync the device nor repeat the line.
+
+        Coverage: eager steps log values; ACL-graph captures log shapes only,
+        because a device sync inside a capture is illegal and a replay never
+        re-enters this Python path; a traced/compiled step logs nothing, since
+        its shapes are symbolic here and the code is not re-run at runtime.
+        """
+        global _flash_attn_debug_records
+        limit = _debug_limit()
+        if limit == 0 or (limit > 0 and _flash_attn_debug_records >= limit):
+            return
+        if torch.compiler.is_compiling():
+            return
+        if getattr(attn_metadata, "_flash_attn_args_dumped", False):
+            return
+        attn_metadata._flash_attn_args_dumped = True
+        _flash_attn_debug_records += 1
+        capturing = bool(getattr(_EXTRA_CTX, "capturing", False))
+        with_values = not capturing
+        logger.info(
+            "%s #%d mode=%s T=%d B=%d "
+            "max_seqlen_q=%d max_seqlen_kv=%d mask_mode=%d "
+            "cu_seqlens_q=%s cu_seqlens_kv=%s seqused_q=%s seqused_kv=%s "
+            "q=%s block_table=%s key_cache=%s value_cache=%s",
+            _FLASH_ATTN_DEBUG_PREFIX,
+            _flash_attn_debug_records,
+            "capture" if capturing else "eager",
+            query.shape[0],
+            block_table.shape[0],
+            max_seqlen_q,
+            max_seqlen_kv,
+            mask_mode,
+            _debug_tensor_str(cu_seqlens_q, with_values),
+            _debug_tensor_str(cu_seqlens_kv, with_values),
+            _debug_tensor_str(seqused_q, with_values),
+            _debug_tensor_str(seqused_kv, with_values),
+            f"shape={tuple(query.shape)} dtype={query.dtype}",
+            _debug_tensor_str(block_table, with_values),
+            f"shape={tuple(self.key_cache.shape)} dtype={self.key_cache.dtype}",
+            f"shape={tuple(self.value_cache.shape)} dtype={self.value_cache.dtype}",
+        )
+
     def forward_impl(
         self,
         query: torch.Tensor,
@@ -296,6 +394,13 @@ class AscendFlashAttnImpl(AscendAttentionBackendImpl):
         # MTP verify steps (Q_S = 1 + num_spec) keep CAUSAL.
         mask_mode = FLASH_ATTN_MASK_MODE_NO_MASK if max_seqlen_q == 1 else FLASH_ATTN_MASK_MODE_CAUSAL
 
+        # The KV side is addressed through block_table + seqused_kv (PA_BBND),
+        # so the KV length tensors and max_seqlen_kv stay unset. Named here so
+        # the debug record and the operator call cannot drift apart.
+        cu_seqlens_kv = None
+        seqused_q = None
+        max_seqlen_kv = -1
+
         fa_metadata = self._get_flash_attn_metadata(
             attn_metadata,
             cu_seqlens_q=cu_seqlens_q,
@@ -311,6 +416,18 @@ class AscendFlashAttnImpl(AscendAttentionBackendImpl):
         # and does not validate the alignment, so a stale tail would feed bogus
         # block ids for the padding rows).
         block_table = attn_metadata.block_tables[: attn_metadata.num_reqs]
+        self._dump_flash_attn_args(
+            attn_metadata,
+            query=query,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            seqused_q=seqused_q,
+            seqused_kv=seqused_kv,
+            mask_mode=mask_mode,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_kv,
+            block_table=block_table,
+        )
         # The doc forbids attn_mask under NO_MASK and requires the fixed
         # 2048x2048 lower-triangular int8 mask under CAUSAL, so the two
         # travel together.
@@ -320,8 +437,8 @@ class AscendFlashAttnImpl(AscendAttentionBackendImpl):
             self.value_cache,
             block_table=block_table,
             cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_kv=None,
-            seqused_q=None,
+            cu_seqlens_kv=cu_seqlens_kv,
+            seqused_q=seqused_q,
             seqused_kv=seqused_kv,
             sinks=self.sinks,
             metadata=fa_metadata,
@@ -333,7 +450,7 @@ class AscendFlashAttnImpl(AscendAttentionBackendImpl):
             win_left=-1,
             win_right=-1,
             max_seqlen_q=max_seqlen_q,
-            max_seqlen_kv=-1,
+            max_seqlen_kv=max_seqlen_kv,
             layout_q=FLASH_ATTN_LAYOUT_TND,
             layout_kv=FLASH_ATTN_LAYOUT_PA_BBND,
             layout_out=FLASH_ATTN_LAYOUT_TND,

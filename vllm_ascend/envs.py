@@ -100,6 +100,15 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (disabled); valid values: 0 or 1. Read once at platform backend
     # selection. Not sensitive.
     "VLLM_ASCEND_ENABLE_FLASH_ATTN": lambda: _strict_binary_env("VLLM_ASCEND_ENABLE_FLASH_ATTN"),
+    # Dump the arguments handed to the CANN flash_attn operator -- cu_seqlens_q,
+    # cu_seqlens_kv, seqused_q, seqused_kv, mask_mode, max_seqlen_q,
+    # max_seqlen_kv -- once per step, plus the query/block-table shapes. Values
+    # are read only when the step runs eagerly; under graph capture the record
+    # carries shapes alone (a device sync inside a capture is illegal, and a
+    # replay never re-enters the Python path). The value caps the number of
+    # records per process: 0 disables, N > 0 emits at most N steps, N < 0
+    # emits every step. Debug aid; not sensitive.
+    "VLLM_ASCEND_FLASH_ATTN_DEBUG": lambda: int(os.getenv("VLLM_ASCEND_FLASH_ATTN_DEBUG", "0")),
     # Override the Unified Buffer (UB) size in KB for Triton kernel tile sizing.
     # 0 (default): auto-detect from device properties, falling back to 192 KB
     # (safe for Ascend 910B/A3). Set to a positive value to override when

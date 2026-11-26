@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from tests.ut.base import TestBase
+from vllm_ascend.attention import flash_attn_v1
 from vllm_ascend.attention.flash_attn_v1 import (
     AscendFlashAttnBackend,
     AscendFlashAttnImpl,
@@ -217,12 +218,11 @@ class TestFlashAttnForward(TestBase):
             seen["kwargs"] = kwargs
             return torch.ones(self.NUM_TOKENS, self.NUM_HEADS, self.HEAD_SIZE), torch.empty(1)
 
-        ops_module = MagicMock(flash_attn=attention_op, flash_attn_metadata=MagicMock(return_value=MagicMock()))
-        with (
-            patch("vllm_ascend.attention.flash_attn_v1.find_spec", return_value=MagicMock()),
-            patch.dict("sys.modules", {"cann_ops_transformer.ops": ops_module}),
-        ):
-            result = self.impl.forward_impl(query, None, None, None, attn_metadata, output)
+        # The ops are resolved once in __init__ and cached on the impl, so the
+        # test injects them there instead of faking the import machinery.
+        self.impl._flash_attn_op = attention_op
+        self.impl._flash_attn_metadata_op = MagicMock(return_value=MagicMock())
+        result = self.impl.forward_impl(query, None, None, None, attn_metadata, output)
         return result, seen
 
     def test_single_row_queries_drop_the_mask(self):
@@ -345,3 +345,121 @@ class TestFlashAttnBackendValidation(TestBase):
             mock_envs.VLLM_ASCEND_ENABLE_FLASH_ATTN = True
             mock_profile.return_value.supports.return_value = True
             self.assertTrue(self._validate())
+
+
+class TestFlashAttnArgsDump(TestBase):
+    """VLLM_ASCEND_FLASH_ATTN_DEBUG dumps the operator operands once a step.
+
+    The first full-attention layer of a step emits the record and marks the
+    metadata; the remaining layers skip it, so a 48-layer model pays one
+    device sync a step at most. Values are materialized only when the step
+    runs eagerly -- a capture logs shapes instead.
+    """
+
+    NUM_HEADS = 8
+    NUM_KV_HEADS = 2
+    HEAD_SIZE = 128
+    NUM_TOKENS = 5
+
+    def setUp(self):
+        self.impl = object.__new__(AscendFlashAttnImpl)
+        self.impl.num_heads = self.NUM_HEADS
+        self.impl.num_kv_heads = self.NUM_KV_HEADS
+        self.impl.head_size = self.HEAD_SIZE
+        self.impl.scale = 1.0 / (self.HEAD_SIZE**0.5)
+        self.impl.sinks = None
+        self.impl.key_cache = torch.zeros(4, 128, self.NUM_KV_HEADS, self.HEAD_SIZE)
+        self.impl.value_cache = torch.zeros(4, 128, self.NUM_KV_HEADS, self.HEAD_SIZE)
+        self.impl._flash_attn_op = MagicMock(
+            return_value=(torch.zeros(self.NUM_TOKENS, self.NUM_HEADS, self.HEAD_SIZE), torch.empty(1))
+        )
+        self.impl._flash_attn_metadata_op = MagicMock(return_value=MagicMock())
+
+    def tearDown(self):
+        # The record counter and the memoized limit are module-level state.
+        flash_attn_v1._flash_attn_debug_records = 0
+        flash_attn_v1._flash_attn_debug_limit = None
+
+    def _metadata(self, *, max_query_len=1, attn_mask=None):
+        return SimpleNamespace(
+            causal=True,
+            num_actual_tokens=self.NUM_TOKENS,
+            num_reqs=2,
+            query_start_loc_gpu=torch.tensor([0, 3, 5], dtype=torch.int32),
+            seq_lens_gpu=torch.tensor([10, 20], dtype=torch.int32),
+            max_query_len=max_query_len,
+            block_tables=torch.zeros(2, 2, dtype=torch.int32),
+            attn_mask=attn_mask,
+        )
+
+    def _run(self, attn_metadata, layers=1):
+        """Drive `layers` decode layers over one step's metadata."""
+        query = torch.zeros(self.NUM_TOKENS, self.NUM_HEADS, self.HEAD_SIZE)
+        output = torch.zeros_like(query)
+        with patch.object(flash_attn_v1, "logger") as mock_logger:
+            for _ in range(layers):
+                self.impl.forward_impl(query, None, None, None, attn_metadata, output)
+        return mock_logger
+
+    @staticmethod
+    def _record(mock_logger):
+        """The single emitted record, flattened to text for assertions."""
+        assert mock_logger.info.call_count == 1, mock_logger.info.call_args_list
+        return " ".join(str(arg) for arg in mock_logger.info.call_args[0])
+
+    def test_disabled_by_default(self):
+        mock_logger = self._run(self._metadata())
+        mock_logger.info.assert_not_called()
+
+    def test_one_record_a_step_shared_by_every_layer(self):
+        flash_attn_v1._flash_attn_debug_limit = 3  # enabled, 3 steps
+        record = self._record(self._run(self._metadata(), layers=48))
+        self.assertIn("[FLASH_ATTN_DEBUG]", record)
+        self.assertIn("mode=eager", record)
+        self.assertIn("T=5", record)
+        self.assertIn("B=2", record)
+        self.assertIn("max_seqlen_q=1", record)
+        self.assertIn("max_seqlen_kv=-1", record)
+        self.assertIn("mask_mode=0", record)
+        # The two length tensors carry their values, the unset ones read None.
+        self.assertIn("values=[0, 3, 5]", record)
+        self.assertIn("values=[10, 20]", record)
+        self.assertIn("cu_seqlens_kv=None", record)
+        self.assertIn("seqused_q=None", record)
+
+    def test_prefill_step_reports_the_causal_geometry(self):
+        flash_attn_v1._flash_attn_debug_limit = 3
+        mask = torch.triu(torch.ones(2048, 2048), diagonal=1).to(torch.int8)
+        record = self._record(self._run(self._metadata(max_query_len=3, attn_mask=mask)))
+        self.assertIn("max_seqlen_q=3", record)
+        self.assertIn("mask_mode=3", record)
+
+    def test_capture_logs_shapes_only(self):
+        # A device sync is illegal inside a graph capture, so values are
+        # skipped there rather than faulting the capture.
+        flash_attn_v1._flash_attn_debug_limit = 3
+        with patch.object(flash_attn_v1, "_EXTRA_CTX", SimpleNamespace(capturing=True)):
+            record = self._record(self._run(self._metadata()))
+        self.assertIn("mode=capture", record)
+        self.assertIn("values=skipped(capture)", record)
+        self.assertIn("shape=(3,)", record)
+        self.assertNotIn("[0, 3, 5]", record)
+
+    def test_cap_stops_the_dump(self):
+        # Each step brings fresh metadata, so only the cap limits the records.
+        flash_attn_v1._flash_attn_debug_limit = 1
+        query = torch.zeros(self.NUM_TOKENS, self.NUM_HEADS, self.HEAD_SIZE)
+        output = torch.zeros_like(query)
+        with patch.object(flash_attn_v1, "logger") as mock_logger:
+            for _ in range(3):
+                self.impl.forward_impl(query, None, None, None, self._metadata(), output)
+        self.assertEqual(mock_logger.info.call_count, 1)
+
+    def test_negative_cap_never_stops(self):
+        flash_attn_v1._flash_attn_debug_limit = -1
+        query = torch.zeros(self.NUM_TOKENS, self.NUM_HEADS, self.HEAD_SIZE)
+        output = torch.zeros_like(query)
+        with patch.object(flash_attn_v1, "logger") as mock_logger:
+            for _ in range(3):
+                self.impl.forward_impl(query, None, None, None, self._metadata(), output)
+        self.assertEqual(mock_logger.info.call_count, 3)
