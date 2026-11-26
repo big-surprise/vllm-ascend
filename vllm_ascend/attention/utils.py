@@ -349,6 +349,10 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     For many of the tensors we keep both NPU and CPU versions.
     """
 
+    # A shallow copy is made for each KV-cache group. Share the dictionary
+    # across those copies so one Flash Attention plan is prepared per step.
+    flash_attn_shared_plans: dict = field(default_factory=dict)
+
     # CPU tensor of sequence lengths for host-side operations.
     # E.g., tensor([128, 256, 64]) for 3 requests with different seq lengths.
     seq_lens_cpu: torch.Tensor = None

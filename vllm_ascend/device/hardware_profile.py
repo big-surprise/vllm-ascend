@@ -66,6 +66,9 @@ class HardwareCapability(Enum):
     SCATTER_ND_FP8_CACHE_STORE = auto()
     # Allow the CANN MegaMoe fused-MC2 path when its model, EP, and config checks pass.
     CANN_MEGAMOE = auto()
+    # CANN ops-transformer flash_attn dual-operator interface
+    # (flash_attn_metadata + flash_attn, Ascend 950PR/950DT ABI).
+    CANN_FLASH_ATTN = auto()
     # Allow A5 MegaMoe's MXFP-only path and its A5-specific calling conventions.
     CANN_MEGAMOE_MXFP = auto()
     # Split a mixed chunked-prefill batch into separate prefill and decode FIA calls.
@@ -353,6 +356,7 @@ _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyTyp
                     HardwareCapability.BGMV_SGMV_META_REGISTRATION,
                     HardwareCapability.CANN_MEGAMOE,
                     HardwareCapability.CANN_MEGAMOE_MXFP,
+                    HardwareCapability.CANN_FLASH_ATTN,
                     HardwareCapability.CHUNKED_PREFILL_PHASE_SPLIT,
                     HardwareCapability.CLUSTER_CPU_TOPOLOGY,
                     HardwareCapability.DSA_C128_STATE_SMALL_BLOCK_SIZES,

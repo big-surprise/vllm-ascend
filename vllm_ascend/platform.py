@@ -251,6 +251,9 @@ class NPUPlatform(Platform):
         key = (use_mla, use_sparse)
         backend_key = (*key, use_compress)
 
+        if not attn_selector_config.use_pcp and _validate_flash_attn_backend(key, attn_selector_config):
+            return "vllm_ascend.attention.flash_attn_v1.AscendFlashAttnBackend"
+
         if not attn_selector_config.use_pcp and _validate_fa3_backend(key, attn_selector_config):
             return "vllm_ascend.attention.fa3_v1.AscendFABackend"
 
@@ -1506,6 +1509,38 @@ def _validate_fa3_backend(key, _attn_selector_config):
     logger.info(
         "In training-inference consistency scenario, FA3 will be enabled, which may cause performance degradation."
     )
+    return True
+
+
+def _validate_flash_attn_backend(key, _attn_selector_config):
+    """Validate the opt-in CANN ops-transformer flash_attn backend.
+
+    Selected only when additional_config.enable_flash_attn is true; the operator ABI
+    ships for the Ascend 950PR/950DT family (A5 profile) and covers
+    non-MLA, non-sparse full attention only.
+    """
+    if get_ascend_config().enable_flash_attn is not True:
+        return False
+    if key != (False, False):
+        raise ValueError("flash_attn backend does not support MLA and SFA.")
+    if not get_current_hardware_profile().supports(HardwareCapability.CANN_FLASH_ATTN):
+        raise ValueError(
+            "flash_attn backend is only available on the Ascend 950PR/950DT family. "
+            "Please disable additional_config.enable_flash_attn on this hardware."
+        )
+    if util.find_spec("cann_ops_transformer") is None:
+        raise ValueError(
+            "cann_ops_transformer is not installed but the flash_attn backend is requested. "
+            "Please install cann_ops_transformer to enable flash_attn."
+        )
+    ops = import_module("cann_ops_transformer.ops")
+    if not (hasattr(ops, "flash_attn") and hasattr(ops, "flash_attn_metadata")):
+        raise ValueError(
+            "cann_ops_transformer is installed but does not provide the "
+            "flash_attn / flash_attn_metadata APIs. Please install a "
+            "cann_ops_transformer build for the Ascend 950PR/950DT family."
+        )
+    logger.info("CANN ops-transformer flash_attn backend is enabled via additional_config.enable_flash_attn.")
     return True
 
 

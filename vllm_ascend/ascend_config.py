@@ -446,6 +446,8 @@ class AscendConfig:
             "enable_kv_nz": false,
             "enable_mc2_hierarchy_comm": false,
             "enable_dsa_cp": false,
+            "allreduce_outplace": false,
+            "enable_flash_attn": false,
             "sfa_dcp_force_tmajor_restore": false,
             "enable_force_eplb": false,
             "enable_pcp_o_proj_weight_sharding": true,
@@ -600,6 +602,24 @@ class AscendConfig:
     enable_kv_nz: bool = False
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
     enable_dsa_cp: bool = False
+    # Issue ordinary model all-reduce as a direct HcclAllReduce with a fresh
+    # receive buffer, borrowing the process group's communicator and
+    # collective stream, instead of torch.distributed.all_reduce mutating its
+    # input in place. The in-place default is unsafe inside a captured graph
+    # (replay rewrites the static input buffer) and carries extra host-side
+    # dispatch cost for small latency-bound messages.
+    #
+    # Off by default. Per-call fallback keeps tensors the fast path cannot
+    # handle (non-FP16/BF16/FP32, non-contiguous, NZ/Fractal formats) on the
+    # default path, so enabling it cannot break correctness. See
+    # distributed/device_communicators/hccl_outplace_ar.py.
+    #
+    #   --additional-config '{"allreduce_outplace": true}'
+    allreduce_outplace: bool = False
+    # Opt in to the CANN ops-transformer Flash Attention backend for A5
+    # non-MLA, non-sparse full-attention layers. Validated at backend selection.
+    #   --additional-config '{"enable_flash_attn": true}'
+    enable_flash_attn: bool = False
     sfa_dcp_force_tmajor_restore: bool = False
     enable_force_eplb: bool = False
     enable_pcp_o_proj_weight_sharding: bool = True
