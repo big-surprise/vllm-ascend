@@ -85,6 +85,7 @@ _IS_VL_MODEL = None
 _HAS_ROPE = None
 _ATNN_CALCULATION_STREAM = None
 _CUSTOM_OP_VENDOR_DIR = "custom_transformer"
+_MEGA_GDN_VENDOR_DIR = "mega_gdn_trio_transformer"
 _CUSTOM_OP_BASE_DIR = (
     os.path.dirname(__file__) if os.path.isabs(__file__) else os.path.abspath(os.path.dirname(__file__))
 )
@@ -456,15 +457,16 @@ def _prepend_env_path(env_name: str, path: str) -> None:
 
 
 def bootstrap_custom_op_env(*, include_vendor_lib: bool = False) -> None:
-    vendor_path = os.path.join(_CUSTOM_OP_BASE_DIR, "_cann_ops_custom", "vendors", _CUSTOM_OP_VENDOR_DIR)
-    if not os.path.exists(vendor_path):
-        return
-    _prepend_env_path("ASCEND_CUSTOM_OPP_PATH", vendor_path)
+    for vendor in (_CUSTOM_OP_VENDOR_DIR, _MEGA_GDN_VENDOR_DIR):
+        vendor_path = os.path.join(_CUSTOM_OP_BASE_DIR, "_cann_ops_custom", "vendors", vendor)
+        if not os.path.exists(vendor_path):
+            continue
+        _prepend_env_path("ASCEND_CUSTOM_OPP_PATH", vendor_path)
 
-    if include_vendor_lib:
-        vendor_lib_path = os.path.join(vendor_path, "op_api", "lib")
-        if os.path.exists(vendor_lib_path):
-            _prepend_env_path("LD_LIBRARY_PATH", vendor_lib_path)
+        if include_vendor_lib:
+            vendor_lib_path = os.path.join(vendor_path, "op_api", "lib")
+            if os.path.exists(vendor_lib_path):
+                _prepend_env_path("LD_LIBRARY_PATH", vendor_lib_path)
 
 
 def _custom_pad(x, pad_dims):
