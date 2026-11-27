@@ -48,7 +48,8 @@ def can_overlap_gdn_qkvz_ba(layer: torch.nn.Module, hidden_states: torch.Tensor)
     return (
         hidden_states.device.type == "npu"
         and hidden_states.dtype == torch.bfloat16
-        and hidden_states.shape == (1, _HIDDEN_SIZE)
+        and hidden_states.ndim == 2
+        and hidden_states.shape[1] == _HIDDEN_SIZE
         and gdn_ba_overlap_enabled()
         and layer.tp_size > 0
         and layer.num_spec == 0
@@ -97,7 +98,8 @@ def _gdn_qkvz_ba_projection(
     # The Triton pointer arithmetic below reads ND storage. QKVZ may be NZ
     # because its projection still goes through F.linear.
     if not (
-        _is_single_decode(prefix)
+        hidden_states.shape == (1, _HIDDEN_SIZE)
+        and _is_single_decode(prefix)
         and hidden_states.is_contiguous()
         and ba_weight.is_contiguous()
         and torch_npu.get_npu_format(hidden_states) == _FORMAT_ND
