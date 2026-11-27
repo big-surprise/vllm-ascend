@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 
-"""Overlap Qwen3.5-27B's single-token BA projection with QKVZ on Ascend950."""
+"""Overlap Qwen3.5 single-token BA projection with QKVZ on Ascend950."""
 
 import torch
 import torch_npu
@@ -15,8 +15,6 @@ from vllm_ascend.ops.linear import AscendMergedColumnParallelLinear, AscendUnqua
 from vllm_ascend.utils import attention_calculation_stream, npu_stream_switch
 
 _HIDDEN_SIZE = 5120
-_QKVZ_SIZE = 4096
-_BA_SIZE = 24
 _BA_REDUCE_BLOCK = 8192
 _FORMAT_ND = 2
 
@@ -42,7 +40,6 @@ def _is_local_unquantized_projection(projection: torch.nn.Module) -> bool:
         and projection.custom_op is None
         and not projection.gather_output
         and projection.bias is None
-        and projection.tp_size == 4
         and projection.weight.dtype == torch.bfloat16
     )
 
@@ -53,13 +50,18 @@ def can_overlap_gdn_qkvz_ba(layer: torch.nn.Module, hidden_states: torch.Tensor)
         and hidden_states.dtype == torch.bfloat16
         and hidden_states.shape == (1, _HIDDEN_SIZE)
         and gdn_ba_overlap_enabled()
-        and layer.tp_size == 4
+        and layer.tp_size > 0
         and layer.num_spec == 0
         and not layer.disable_tp_for_ba_proj
         and _is_local_unquantized_projection(layer.in_proj_qkvz)
         and _is_local_unquantized_projection(layer.in_proj_ba)
-        and layer.in_proj_qkvz.weight.shape == (_QKVZ_SIZE, _HIDDEN_SIZE)
-        and layer.in_proj_ba.weight.shape == (_BA_SIZE, _HIDDEN_SIZE)
+        and layer.in_proj_qkvz.tp_size == layer.tp_size
+        and layer.in_proj_ba.tp_size == layer.tp_size
+        and (2 * layer.key_dim + 2 * layer.value_dim) % layer.tp_size == 0
+        and (2 * layer.num_v_heads) % layer.tp_size == 0
+        and layer.in_proj_qkvz.weight.shape
+        == ((2 * layer.key_dim + 2 * layer.value_dim) // layer.tp_size, _HIDDEN_SIZE)
+        and layer.in_proj_ba.weight.shape == ((2 * layer.num_v_heads) // layer.tp_size, _HIDDEN_SIZE)
     )
 
 
@@ -92,6 +94,8 @@ def _gdn_qkvz_ba_projection(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # Read the metadata at execution/capture time so it is not baked into
     # the Dynamo trace. Triton reads the two inputs using their ND addresses.
+    # The Triton pointer arithmetic below reads ND storage. QKVZ may be NZ
+    # because its projection still goes through F.linear.
     if not (
         _is_single_decode(prefix)
         and hidden_states.is_contiguous()
@@ -99,16 +103,20 @@ def _gdn_qkvz_ba_projection(
         and torch_npu.get_npu_format(hidden_states) == _FORMAT_ND
         and torch_npu.get_npu_format(ba_weight) == _FORMAT_ND
     ):
-        return torch.nn.functional.linear(hidden_states, qkvz_weight), torch.nn.functional.linear(hidden_states, ba_weight)
+        return (
+            torch.nn.functional.linear(hidden_states, qkvz_weight),
+            torch.nn.functional.linear(hidden_states, ba_weight),
+        )
 
     main = torch.npu.current_stream()
     side = attention_calculation_stream()
     # Allocate on the consumer stream. The fork orders the reads of the input
     # and the join orders the caller's reads of BA and the reuse of its storage.
-    ba = hidden_states.new_empty((1, _BA_SIZE))
+    ba_rows = ba_weight.shape[0]
+    ba = hidden_states.new_empty((1, ba_rows))
     side.wait_stream(main)
     with npu_stream_switch(side):
-        _gdn_ba_vector_gemv[(_BA_SIZE,)](
+        _gdn_ba_vector_gemv[(ba_rows,)](
             hidden_states, ba_weight, ba, _HIDDEN_SIZE, _BA_REDUCE_BLOCK, enable_fp_fusion=False
         )
     qkvz = torch.nn.functional.linear(hidden_states, qkvz_weight)

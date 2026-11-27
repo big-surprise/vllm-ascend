@@ -41,3 +41,31 @@ def test_gdn_ba_overlap_requires_actual_single_token_decode(overrides, expected)
         assert _is_single_decode("gdn") is expected
         assert not _is_single_decode("other")
     assert not _is_single_decode("gdn")
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+def test_gdn_ba_overlap_checks_shard_geometry(monkeypatch, tp_size):
+    import torch
+
+    from vllm_ascend.ops import gdn_ba_overlap as overlap
+
+    monkeypatch.setattr(overlap, "gdn_ba_overlap_enabled", lambda: True)
+    monkeypatch.setattr(overlap, "_is_local_unquantized_projection", lambda projection: True)
+    qkvz = SimpleNamespace(
+        tp_size=tp_size, weight=torch.empty(16384 // tp_size, 5120)
+    )
+    ba = SimpleNamespace(
+        tp_size=tp_size, weight=torch.empty(96 // tp_size, 5120)
+    )
+    layer = SimpleNamespace(
+        tp_size=tp_size, num_spec=0, disable_tp_for_ba_proj=False,
+        key_dim=2048, value_dim=6144, num_v_heads=48,
+        in_proj_qkvz=qkvz, in_proj_ba=ba,
+    )
+    activation = SimpleNamespace(
+        shape=(1, 5120), dtype=torch.bfloat16,
+        device=SimpleNamespace(type="npu"),
+    )
+    assert overlap.can_overlap_gdn_qkvz_ba(layer, activation)
+    ba.weight = torch.empty(ba.weight.shape[0] + 1, 5120)
+    assert not overlap.can_overlap_gdn_qkvz_ba(layer, activation)

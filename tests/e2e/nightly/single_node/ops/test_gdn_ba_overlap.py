@@ -15,16 +15,17 @@ from vllm_ascend.ops.triton.fla.split_gdn_projection import split_gdn_projection
 from vllm_ascend.utils import attention_calculation_stream
 
 
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
 @pytest.mark.parametrize("nz_qkvz", [False, True])
 @torch.inference_mode()
-def test_gdn_ba_overlap_graph_after_input_change(nz_qkvz):
+def test_gdn_ba_overlap_graph_after_input_change(nz_qkvz, tp_size):
     if not get_current_hardware_profile().supports(HardwareCapability.GDN_BA_VECTOR_OVERLAP):
         pytest.skip("GDN BA Vector overlap is validated on Ascend950")
 
     torch.manual_seed(41)
     x = torch.randn((1, 5120), device="npu", dtype=torch.bfloat16)
-    qkvz_weight = torch.randn((4096, 5120), device="npu", dtype=torch.bfloat16) * 0.02
-    ba_weight = torch.randn((24, 5120), device="npu", dtype=torch.bfloat16) * 0.02
+    qkvz_weight = torch.randn((16384 // tp_size, 5120), device="npu", dtype=torch.bfloat16) * 0.02
+    ba_weight = torch.randn((96 // tp_size, 5120), device="npu", dtype=torch.bfloat16) * 0.02
     if nz_qkvz:
         qkvz_weight = torch_npu.npu_format_cast(qkvz_weight.t().contiguous(), 29).t()
     metadata = GDNAttentionMetadata(
@@ -61,13 +62,13 @@ def test_gdn_ba_overlap_graph_after_input_change(nz_qkvz):
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph):
             qkvz, ba = compiled(x, qkvz_weight, ba_weight)
-            actual = split_gdn_projection(qkvz, ba, 2560, 1536, 128)
+            actual = split_gdn_projection(qkvz, ba, 10240 // tp_size, 6144 // tp_size, 128)
 
     for scale in (0.25, 0.7, 1.5):
         x.copy_(torch.randn_like(x) * scale)
         graph.replay()
         expected_qkvz = torch.nn.functional.linear(x + 0.25, qkvz_weight)
         expected_ba = torch.nn.functional.linear(x + 0.25, ba_weight)
-        expected = split_gdn_projection(expected_qkvz, expected_ba, 2560, 1536, 128)
+        expected = split_gdn_projection(expected_qkvz, expected_ba, 10240 // tp_size, 6144 // tp_size, 128)
         for result, reference in zip(actual, expected):
             torch.testing.assert_close(result, reference, rtol=0, atol=0)
