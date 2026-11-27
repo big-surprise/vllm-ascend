@@ -35,6 +35,7 @@ alibi and quantized KV caches are out of scope; the constructor rejects
 them instead of silently falling back.
 """
 
+from contextlib import contextmanager
 from importlib import import_module
 from importlib.util import find_spec
 
@@ -121,6 +122,17 @@ class AscendFlashAttnMetadataBuilder(AscendAttentionMetadataBuilder):
 
     def enable_device_metadata(self) -> None:
         self._device_metadata_enabled = True
+
+    @contextmanager
+    def defer_device_metadata(self, *, in_graph: bool = False):
+        # MRV2 discovers producers through this context manager. Keep V1's
+        # persistent enablement intact if the same builder is used there.
+        was_enabled = self._device_metadata_enabled
+        self._device_metadata_enabled = True
+        try:
+            yield
+        finally:
+            self._device_metadata_enabled = was_enabled
 
     def take_device_metadata_tasks(self) -> tuple[DeviceMetadataTask, ...]:
         tasks = self._device_metadata_tasks
