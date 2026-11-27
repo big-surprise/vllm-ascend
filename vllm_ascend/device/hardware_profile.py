@@ -106,6 +106,8 @@ class HardwareCapability(Enum):
     FUSED_SWIGLU_TUNING_ARGS = auto()
     # Select the compatibility GatedDeltaNet core and state-dtype implementation.
     GDN_COMPATIBILITY = auto()
+    # Overlap the Qwen3.5 BA Vector GEMV with the QKVZ Cube projection.
+    GDN_BA_VECTOR_OVERLAP = auto()
     # Register the FX graph rewrites that fuse an MXFP8 quantized matmul with the adjacent
     # sequence-parallel reduce-scatter or all-gather collective.
     GRAPH_QUANT_MATMUL_COMM_FUSION = auto()
@@ -367,6 +369,7 @@ _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyTyp
                     HardwareCapability.DYNAMIC_MX_QUANT_FUSION,
                     HardwareCapability.DYNAMIC_MX_QUANT_SCALE_ALG_ONE,
                     HardwareCapability.FLA_GDN_PREFILL,
+                    HardwareCapability.GDN_BA_VECTOR_OVERLAP,
                     HardwareCapability.FP8_ATTENTION,
                     HardwareCapability.FUSED_ROTARY_MUL_INTERLEAVE,
                     HardwareCapability.GRAPH_QUANT_MATMUL_COMM_FUSION,

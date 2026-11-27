@@ -46,6 +46,7 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNFusedAttentionBackend
+from vllm_ascend.ops.gdn_ba_overlap import can_overlap_gdn_qkvz_ba, gdn_ba_overlap_enabled
 from vllm_ascend.ops.mega_gdn_decode import (
     mega_gdn_decode_enabled,
     prepare_mega_gdn_weights,
@@ -64,7 +65,7 @@ from vllm_ascend.ops.triton.fused_gdn_gating_l2norm import (
 )
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
 from vllm_ascend.ops.triton.mamba.state_index import gather_ssm_states, scatter_ssm_states_
-from vllm_ascend.utils import get_weight_prefetch_method
+from vllm_ascend.utils import attention_calculation_stream, get_weight_prefetch_method
 
 logger = init_logger(__name__)
 
@@ -165,6 +166,8 @@ def initialize_packed_conv_weight(layer: nn.Module) -> None:
         _pack_conv_weights(conv1d)
         if mega_gdn_decode_enabled():
             prepare_mega_gdn_weights(layer)
+        if conv1d.weight.device.type == "npu" and gdn_ba_overlap_enabled() and layer.tp_size == 4:
+            attention_calculation_stream()
         return result
 
     quant_method.process_weights_after_loading = process_weights_and_pack
@@ -457,9 +460,14 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             a = a.contiguous()
         else:
             if not self.gqa_interleaved_layout:
-                mixed_qkvz, ba = project_with_shared_quant(
-                    self, hidden_states, ("in_proj_qkvz", "in_proj_ba"), sp_num_tokens
-                )
+                if sp_num_tokens is None and can_overlap_gdn_qkvz_ba(self, hidden_states):
+                    mixed_qkvz, ba = torch.ops.vllm.ascend_gdn_qkvz_ba_projection(
+                        hidden_states, self.in_proj_qkvz.weight, self.in_proj_ba.weight, self.prefix
+                    )
+                else:
+                    mixed_qkvz, ba = project_with_shared_quant(
+                        self, hidden_states, ("in_proj_qkvz", "in_proj_ba"), sp_num_tokens
+                    )
                 num_tokens = mixed_qkvz.size(0)
                 qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
                 z_size = self.value_dim // self.tp_size
