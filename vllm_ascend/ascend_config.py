@@ -192,11 +192,14 @@ class AscendFusionConfig:
         fusion_ops_mega_gdn_decode: Use the xLLM MegaGdnDecode operator for
             BF16, non-speculative, pure decode batches on Ascend 950. Requires
             the custom OPP package; unsupported batches keep the existing path.
+        overlap_gdn_qkvz_ba: Overlap the Vector BA projection with the QKVZ
+            projection for Qwen3.5-27B BF16 TP4 single-token decode on Ascend950.
     """
 
     fusion_ops_gmmswigluquant: bool = True
     fusion_ops_gdn_gate_norm: bool = False
     fusion_ops_mega_gdn_decode: bool = False
+    overlap_gdn_qkvz_ba: bool = False
 
 
 @config(config=ConfigDict(frozen=True))
@@ -481,7 +484,8 @@ class AscendConfig:
             "ascend_fusion_config": {
                 "fusion_ops_gmmswigluquant": true,
                 "fusion_ops_gdn_gate_norm": false,
-                "fusion_ops_mega_gdn_decode": false
+                "fusion_ops_mega_gdn_decode": false,
+                "overlap_gdn_qkvz_ba": false
             },
             "ascend_warmup_config": {
                 "enable_early_kernel_warmup": false,
