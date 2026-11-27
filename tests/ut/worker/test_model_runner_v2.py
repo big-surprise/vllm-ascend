@@ -23,6 +23,7 @@ from vllm_ascend.attention.attention_c8_mxfp import (
     mxfp_paged_cache_views,
     mxfp_v_scale_cache_shape,
 )
+from vllm_ascend.attention.flash_attn_v1 import AscendFlashAttnMetadataBuilder
 from vllm_ascend.attention.mla_v1 import AscendMLAImpl
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
@@ -1167,7 +1168,8 @@ def test_sample_tokens_spec_pp_broadcasts_draft_tokens(dump_mode):
 
 @pytest.mark.parametrize("a5", [False, True])
 @pytest.mark.parametrize("architecture", ["DeepseekV41ForCausalLM", "OtherModel"])
-def test_initialize_kv_cache_installs_aclgraph_factory_and_pcp(a5, architecture):
+@pytest.mark.parametrize("flash_attn", [False, True])
+def test_initialize_kv_cache_installs_aclgraph_factory_and_pcp(a5, architecture, flash_attn):
     """Cache binding precedes KDA preparation and preserves PCP setup."""
     runner = _make_runner()
     runner.input_buffers = object()
@@ -1186,6 +1188,7 @@ def test_initialize_kv_cache_installs_aclgraph_factory_and_pcp(a5, architecture)
     kv_cache_config = KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])
     original = vllm_model_runner.ModelCudaGraphManager
     seen = {}
+    flash_builder = object.__new__(AscendFlashAttnMetadataBuilder) if flash_attn else None
     kv_cache_config = KVCacheConfig(
         num_blocks=1,
         kv_cache_tensors=[],
@@ -1194,7 +1197,15 @@ def test_initialize_kv_cache_installs_aclgraph_factory_and_pcp(a5, architecture)
 
     def _super(self, kv_cache_config, kv_cache_allocation_context=None):
         self.kv_cache_config = kv_cache_config
-        self.attn_groups = []
+        self.attn_groups = (
+            [[SimpleNamespace(
+                get_metadata_builder=lambda _: flash_builder,
+                metadata_builders=[flash_builder],
+                backend=None,
+                layer_names=[],
+            )]]
+            if flash_attn else []
+        )
         seen["factory"] = vllm_model_runner.ModelCudaGraphManager
         seen["cfg"] = kv_cache_config
 
@@ -1224,9 +1235,9 @@ def test_initialize_kv_cache_installs_aclgraph_factory_and_pcp(a5, architecture)
     can_skip_sync.assert_called_once_with()
     assert runner._skip_spec_cpu_length_sync is False
     assert runner.model_state.device_metadata == (
-        "metadata" if a5 and architecture == "DeepseekV41ForCausalLM" else None
+        "metadata" if flash_attn or (a5 and architecture == "DeepseekV41ForCausalLM") else None
     )
-    assert metadata_cls.call_count == int(a5 and architecture == "DeepseekV41ForCausalLM")
+    assert metadata_cls.call_count == int(flash_attn or (a5 and architecture == "DeepseekV41ForCausalLM"))
     assert seen["cfg"] == kv_cache_config
     assert seen["cfg"] is not kv_cache_config
     assert vllm_model_runner.ModelCudaGraphManager is original
@@ -1238,6 +1249,18 @@ def test_initialize_kv_cache_installs_aclgraph_factory_and_pcp(a5, architecture)
     assert runner.model_state.pcp_manager is runner.pcp_manager
     assert runner.speculator.pcp_manager is runner.pcp_manager
     runner.init_routed_experts_capturer.assert_called_once_with()
+
+
+def test_flash_attn_builder_device_metadata_scope():
+    builder = object.__new__(AscendFlashAttnMetadataBuilder)
+    builder._device_metadata_enabled = False
+    with builder.defer_device_metadata(in_graph=True):
+        assert builder._device_metadata_enabled
+    assert not builder._device_metadata_enabled
+    builder.enable_device_metadata()
+    with builder.defer_device_metadata(in_graph=False):
+        assert builder._device_metadata_enabled
+    assert builder._device_metadata_enabled
 
 
 def test_initialize_kv_cache_forwards_allocation_context():
