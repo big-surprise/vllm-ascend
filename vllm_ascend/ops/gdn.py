@@ -105,6 +105,20 @@ def _ba_fused_proj_enabled() -> bool:
     return get_ascend_config().enable_gdn_ba_overlap_stream
 
 
+def _uses_internal_weight_format(tensor: torch.Tensor) -> bool:
+    """Whether a weight uses an NPU private format that ``torch.cat`` rejects.
+
+    Load-time layouts such as ``linear_attention_qkvz_layout=nz_kn`` replace
+    the Parameter storage with a transposed FRACTAL_NZ tensor. Concatenating
+    such tensors fails with "current operator cat do not support internal
+    format", so the fusion must stand down and keep the serial path.
+    """
+    try:
+        return int(torch_npu.get_npu_format(tensor)) != int(torch_npu.Format.ND)
+    except (AttributeError, RuntimeError, TypeError):
+        return False
+
+
 def fuse_ba_into_qkvz(attn) -> None:
     """Append ba's output columns to the qkv(z) weight after loading.
 
@@ -169,6 +183,13 @@ def fuse_ba_into_qkvz(attn) -> None:
     if mw is None or bw is None or mw.dtype != bw.dtype:
         return
     if mw.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        return
+    if _uses_internal_weight_format(mw) or _uses_internal_weight_format(bw):
+        logger.warning_once(
+            "enable_gdn_ba_overlap_stream cannot fuse in_proj_ba into in_proj_qkvz: "
+            "the weights use an NPU internal format (e.g. linear_attention_qkvz_layout=nz_kn) "
+            "that torch.cat does not support. Keeping the serial projection path."
+        )
         return
     if getattr(main, "bias", None) is not None or getattr(ba, "bias", None) is not None:
         return
