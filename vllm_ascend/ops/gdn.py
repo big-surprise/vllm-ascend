@@ -362,7 +362,7 @@ def initialize_packed_conv_weight(layer: nn.Module) -> None:
         _pack_conv_weights(conv1d)
         if mega_gdn_decode_enabled():
             prepare_mega_gdn_weights(layer)
-        if conv1d.weight.device.type == "npu" and gdn_ba_overlap_enabled() and layer.tp_size == 4:
+        if conv1d.weight.device.type == "npu" and gdn_ba_overlap_enabled() and layer.tp_size > 0:
             attention_calculation_stream()
         return result
 

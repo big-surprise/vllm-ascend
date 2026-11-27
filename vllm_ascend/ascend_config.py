@@ -193,7 +193,7 @@ class AscendFusionConfig:
             BF16, non-speculative, pure decode batches on Ascend 950. Requires
             the custom OPP package; unsupported batches keep the existing path.
         overlap_gdn_qkvz_ba: Overlap the Vector BA projection with the QKVZ
-            projection for Qwen3.5-27B BF16 TP4 single-token decode on Ascend950.
+            projection for Qwen3.5 BF16 single-token decode on Ascend950.
     """
 
     fusion_ops_gmmswigluquant: bool = True
