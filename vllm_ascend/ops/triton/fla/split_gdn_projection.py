@@ -5,6 +5,7 @@
 
 import torch
 from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import direct_register_custom_op
 
 _BLOCK = 1024
 
@@ -39,19 +40,18 @@ def _split_gdn_projection_kernel(
     tl.store(a_out + row * BA_HALF + columns, a, mask=columns < BA_HALF)
 
 
-def split_gdn_projection(
+def _split_gdn_projection_impl(
     qkvz: torch.Tensor,
     ba: torch.Tensor,
+    mixed_qkv: torch.Tensor,
+    z: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
     qkv_dim: int,
     z_dim: int,
-    head_v_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ba_half: int,
+) -> None:
     num_tokens = qkvz.shape[0]
-    ba_half = ba.shape[-1] // 2
-    mixed_qkv = torch.empty((num_tokens, qkv_dim), device=qkvz.device, dtype=qkvz.dtype)
-    z = torch.empty((num_tokens, z_dim // head_v_dim, head_v_dim), device=qkvz.device, dtype=qkvz.dtype)
-    b = torch.empty((num_tokens, ba_half), device=ba.device, dtype=ba.dtype)
-    a = torch.empty_like(b)
     _split_gdn_projection_kernel[(num_tokens, triton.cdiv(max(qkv_dim, z_dim, ba_half), _BLOCK))](
         qkvz,
         ba,
@@ -66,4 +66,42 @@ def split_gdn_projection(
         ba_half,
         _BLOCK,
     )
+
+
+def _split_gdn_projection_fake(
+    qkvz: torch.Tensor,
+    ba: torch.Tensor,
+    mixed_qkv: torch.Tensor,
+    z: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    qkv_dim: int,
+    z_dim: int,
+    ba_half: int,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="ascend_split_gdn_projection",
+    op_func=_split_gdn_projection_impl,
+    mutates_args=["mixed_qkv", "z", "b", "a"],
+    fake_impl=_split_gdn_projection_fake,
+)
+
+
+def split_gdn_projection(
+    qkvz: torch.Tensor,
+    ba: torch.Tensor,
+    qkv_dim: int,
+    z_dim: int,
+    head_v_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_tokens = qkvz.shape[0]
+    ba_half = ba.shape[-1] // 2
+    mixed_qkv = torch.empty((num_tokens, qkv_dim), device=qkvz.device, dtype=qkvz.dtype)
+    z = torch.empty((num_tokens, z_dim // head_v_dim, head_v_dim), device=qkvz.device, dtype=qkvz.dtype)
+    b = torch.empty((num_tokens, ba_half), device=ba.device, dtype=ba.dtype)
+    a = torch.empty_like(b)
+    torch.ops.vllm.ascend_split_gdn_projection(qkvz, ba, mixed_qkv, z, b, a, qkv_dim, z_dim, ba_half)
     return mixed_qkv, z, b, a
