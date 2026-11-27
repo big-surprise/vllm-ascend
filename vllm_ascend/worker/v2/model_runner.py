@@ -66,6 +66,7 @@ from vllm_ascend.attention.attention_c8_mxfp import (
     fill_mxfp_v_scale_cache,
 )
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
+from vllm_ascend.attention.flash_attn_v1 import AscendFlashAttnMetadataBuilder
 from vllm_ascend.attention.flashmla import prepare_flashmla_batch_req_state
 from vllm_ascend.attention.mla_v1 import AscendMLABackend, all_mla_use_flashmla
 from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
@@ -504,9 +505,15 @@ class NPUModelRunner(GPUModelRunner):
         prepare_v41_source_rope(self)
         # Recreate along with KV initialization: profiling capture owns a
         # throwaway model state and must not leak event/buffer bindings.
+        has_flash_attn_builder = any(
+            isinstance(group.get_metadata_builder(0), AscendFlashAttnMetadataBuilder)
+            for groups in self.attn_groups
+            for group in groups
+        )
         self.model_state.device_metadata = (
             TargetDeviceMetadata()
-            if uses_a5_packed_cache() and self.model_config.architecture == "DeepseekV41ForCausalLM"
+            if has_flash_attn_builder
+            or (uses_a5_packed_cache() and self.model_config.architecture == "DeepseekV41ForCausalLM")
             else None
         )
 

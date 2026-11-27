@@ -36,6 +36,7 @@ alibi and quantized KV caches are out of scope; the constructor rejects
 them instead of silently falling back.
 """
 
+from contextlib import contextmanager
 from importlib import import_module
 from importlib.util import find_spec
 
@@ -82,6 +83,149 @@ def get_flash_attn_ops() -> tuple | None:
     if callable(attention_op) and callable(metadata_op):
         return attention_op, metadata_op
     return None
+
+
+class AscendFlashAttnMetadataBuilder(AscendAttentionMetadataBuilder):
+    """Start one Flash Attention plan on the metadata stream per step."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._device_metadata_enabled = False
+        self._device_metadata_tasks: tuple[DeviceMetadataTask, ...] = ()
+        # Stable addresses for graph consumers, keyed by the captured shape.
+        self._async_buffers: dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+
+    def enable_device_metadata(self) -> None:
+        self._device_metadata_enabled = True
+
+    @contextmanager
+    def defer_device_metadata(self, *, in_graph: bool = False):
+        # MRV2 discovers producers through this context manager. Keep V1's
+        # persistent enablement intact if the same builder is used there.
+        was_enabled = self._device_metadata_enabled
+        self._device_metadata_enabled = True
+        try:
+            yield
+        finally:
+            self._device_metadata_enabled = was_enabled
+
+    def take_device_metadata_tasks(self) -> tuple[DeviceMetadataTask, ...]:
+        tasks = self._device_metadata_tasks
+        self._device_metadata_tasks = ()
+        return tasks
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: AscendCommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> AscendMetadata:
+        metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
+        # The runner may append a dummy request to cover graph-padding rows.
+        # Flash Attention's TND query and cu_seqlens_q must include those rows,
+        # while reshape_and_cache still writes only num_actual_tokens real K/V.
+        query_starts_cpu = common_attn_metadata.query_start_loc_cpu[: metadata.num_reqs + 1]
+        metadata.flash_attn_num_tokens = int(query_starts_cpu[-1])
+        if getattr(self.vllm_config.compilation_config, "cudagraph_mode", None) == CUDAGraphMode.FULL:
+            # Replay can redistribute a fixed graph bucket among requests.
+            # A plan captured with the dummy run's exact max would be too small
+            # for a later step. The bucket's token count is a stable bound.
+            metadata.flash_attn_max_seqlen_q = metadata.flash_attn_num_tokens
+        else:
+            metadata.flash_attn_max_seqlen_q = (
+                int((query_starts_cpu[1:] - query_starts_cpu[:-1]).max()) if metadata.num_reqs else 0
+            )
+        if (
+            not self._device_metadata_enabled
+            or metadata.flash_attn_num_tokens <= 0
+            or metadata.num_prefills > 0
+        ):
+            return metadata
+
+        layer = self.vllm_config.compilation_config.static_forward_context[self.layer_names[0]]
+        impl = layer.impl
+        num_heads, num_kv_heads, head_size = impl.num_heads, impl.num_kv_heads, impl.head_size
+        num_reqs = metadata.num_reqs
+        num_tokens = metadata.flash_attn_num_tokens
+        max_seqlen_q = metadata.flash_attn_max_seqlen_q
+        mask_mode = FLASH_ATTN_MASK_MODE_NO_MASK if max_seqlen_q == 1 else FLASH_ATTN_MASK_MODE_CAUSAL
+        shared_key = (
+            id(metadata.query_start_loc_gpu),
+            id(metadata.seq_lens_gpu),
+            num_reqs,
+            num_tokens,
+            num_heads,
+            num_kv_heads,
+            head_size,
+            max_seqlen_q,
+            mask_mode,
+        )
+        shared = common_attn_metadata.flash_attn_shared_plans
+        buffers = shared.get(shared_key)
+        if buffers is None:
+            buffer_key = (
+                metadata.query_start_loc_gpu.data_ptr(),
+                metadata.seq_lens_gpu.data_ptr(),
+                num_reqs,
+                num_tokens,
+                num_heads,
+                num_kv_heads,
+                head_size,
+                max_seqlen_q,
+                mask_mode,
+            )
+            buffers = self._async_buffers.get(buffer_key)
+            metadata_op = impl._flash_attn_metadata_op
+            query_starts = metadata.query_start_loc_gpu
+            kv_lengths = metadata.seq_lens_gpu
+
+            def update_lengths(cu_seqlens_q: torch.Tensor, seqused_kv: torch.Tensor) -> None:
+                _copy_flash_lengths(query_starts, kv_lengths, num_reqs, num_tokens, cu_seqlens_q, seqused_kv)
+
+            def make_plan(cu_seqlens_q: torch.Tensor, seqused_kv: torch.Tensor) -> torch.Tensor:
+                return metadata_op(
+                    num_heads,
+                    num_kv_heads,
+                    head_size,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_kv=None,
+                    seqused_q=None,
+                    seqused_kv=seqused_kv,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_kv=-1,
+                    mask_mode=mask_mode,
+                    win_left=-1,
+                    win_right=-1,
+                    layout_q=FLASH_ATTN_LAYOUT_TND,
+                    layout_kv=FLASH_ATTN_LAYOUT_PA_BBND,
+                    layout_out=FLASH_ATTN_LAYOUT_TND,
+                )
+
+            if buffers is None:
+                cu_seqlens_q = torch.empty((num_reqs + 1,), dtype=query_starts.dtype, device=query_starts.device)
+                seqused_kv = torch.empty((num_reqs,), dtype=kv_lengths.dtype, device=kv_lengths.device)
+                # The CANN wrapper owns the metadata output shape. Seed the
+                # stable buffer once per captured shape, before graph capture.
+                update_lengths(cu_seqlens_q, seqused_kv)
+                plan = make_plan(cu_seqlens_q, seqused_kv)
+                buffers = (cu_seqlens_q, seqused_kv, plan)
+                self._async_buffers[buffer_key] = buffers
+
+            cu_seqlens_q, seqused_kv, plan = buffers
+
+            def prepare() -> None:
+                update_lengths(cu_seqlens_q, seqused_kv)
+                plan.copy_(make_plan(cu_seqlens_q, seqused_kv))
+
+            self._device_metadata_tasks = (
+                *self._device_metadata_tasks,
+                DeviceMetadataTask(DeviceMetadataStage.ATTENTION, prepare, id(plan)),
+            )
+            shared[shared_key] = buffers
+
+        metadata.flash_attn_async_cu, metadata.flash_attn_async_kv, metadata.flash_attn_async_plan = buffers
+        metadata.flash_attn_async_group_id = id(buffers[2])
+        return metadata
 
 
 class AscendFlashAttnBackend(AscendAttentionBackend):
