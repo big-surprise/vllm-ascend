@@ -178,6 +178,12 @@ class AscendMetadata:
     num_decode_tokens: int = 0
     num_prefills: int = 0
     num_decodes: int = 0
+    # Number of requests (sequences) this step, excluding any dummy padding
+    # request. This is the exact batch size the operator should be driven
+    # with: cu_seqlens_q has length num_reqs + 1, seqused_kv length num_reqs,
+    # and block_tables num_reqs rows -- the three must stay aligned (the
+    # flash_attn op does not validate this, see its torch API doc).
+    num_reqs: int = 0
 
     # The sequence length per sequence. Sequence length means the computed
     # tokens + new tokens (is None if it is a decoding).
@@ -230,6 +236,13 @@ class AscendMetadata:
     # for. Only used on the eager path -- graph capture bypasses the cache so
     # the metadata op executes inside the captured region.
     qfa_metadata_cache: dict = field(default_factory=dict)
+    # Per-step scratch for non-quantized CANN flash_attn layers. One
+    # AscendMetadata is built per step and shared by all attention layers, so
+    # the metadata plan, length derivation, scalars, int8 mask and sliced
+    # block table are computed once by the first full-attention layer and
+    # reused by the rest. Keys: "lengths", "scalars", "attn_mask",
+    # "block_table", and the plan-key tuple.
+    flash_attn_metadata_cache: dict = field(default_factory=dict)
     pcp_local_num_input_tokens: int | None = None
 
 
@@ -408,6 +421,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         attn_metadata = self.metadata_cls(
             num_actual_tokens=num_actual_tokens,
             num_decode_tokens=num_decode_tokens,
+            num_reqs=num_reqs,
             block_tables=block_table,
             query_start_loc=query_start_loc,
             query_start_loc_gpu=common_attn_metadata.query_start_loc,

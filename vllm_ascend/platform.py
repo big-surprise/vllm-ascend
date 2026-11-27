@@ -251,8 +251,13 @@ class NPUPlatform(Platform):
         key = (use_mla, use_sparse)
         backend_key = (*key, use_compress)
 
+        # FA3 stays ahead of flash_attn: it is chosen only when RL
+        # training-inference consistency requires its exact kernel.
         if not attn_selector_config.use_pcp and _validate_fa3_backend(key, attn_selector_config):
             return "vllm_ascend.attention.fa3_v1.AscendFABackend"
+
+        if not attn_selector_config.use_pcp and _validate_flash_attn_backend(key, attn_selector_config):
+            return "vllm_ascend.attention.flash_attn_v1.AscendFlashAttnBackend"
 
         backend_map = {
             (True, False, False): "vllm_ascend.attention.mla_v1.AscendMLABackend",
@@ -1506,6 +1511,45 @@ def _validate_fa3_backend(key, _attn_selector_config):
     logger.info(
         "In training-inference consistency scenario, FA3 will be enabled, which may cause performance degradation."
     )
+    return True
+
+
+def _validate_flash_attn_backend(key, _attn_selector_config):
+    """Select the CANN ops-transformer flash_attn backend when it is usable.
+
+    This is the default full-attention backend for non-MLA, non-sparse
+    attention on hardware that ships the operator ABI (Ascend 950PR/950DT,
+    the A5 profile). No opt-in switch: whenever the capability, the package
+    and both APIs are present, the backend is used.
+
+    Anything missing keeps the previous behaviour instead of failing, because
+    the backend is now on by default: MLA/SFA and DCP keep their own
+    implementations, non-A5 hardware (or a cann_ops_transformer build that
+    predates the flash_attn API) falls back to FA3/FIA. Downgrading is logged
+    once so the fallback is not silent in support cases.
+    """
+    if key != (False, False):
+        return False
+    if not get_current_hardware_profile().supports(HardwareCapability.CANN_FLASH_ATTN):
+        return False
+    # DCP owns a dedicated implementation (attention_cp); selecting flash_attn
+    # here would fail later in AscendFlashAttnBackend.get_impl_cls.
+    if getattr(_attn_selector_config, "use_dcp", False):
+        return False
+    if util.find_spec("cann_ops_transformer") is None:
+        logger.warning_once(
+            "cann_ops_transformer is not installed; using the FIA backend for full attention."
+        )
+        return False
+    ops = import_module("cann_ops_transformer.ops")
+    if not (hasattr(ops, "flash_attn") and hasattr(ops, "flash_attn_metadata")):
+        logger.warning_once(
+            "cann_ops_transformer does not provide the flash_attn / flash_attn_metadata APIs; "
+            "using the FIA backend for full attention. Install a build for the Ascend "
+            "950PR/950DT family to enable flash_attn."
+        )
+        return False
+    logger.info_once("CANN ops-transformer flash_attn backend is enabled for full attention.")
     return True
 
 

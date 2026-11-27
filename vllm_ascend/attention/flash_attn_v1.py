@@ -1,0 +1,389 @@
+#
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# This file is a part of the vllm-ascend project.
+#
+"""Non-quantized flash_attn attention backend (CANN ops-transformer interface).
+
+Implements the torch API declared in ops-transformer's
+``attention/flash_attn/docs/torchapi_flash_attn.md``: a metadata operator
+(``cann_ops_transformer.ops.flash_attn_metadata``) that pre-plans the
+load-balancing task split, followed by the main operator
+(``cann_ops_transformer.ops.flash_attn``). The ABI ships only for the
+Ascend 950PR/950DT family (the A5 hardware profile), so the backend is the
+default full-attention path there and is selected in
+``platform.get_attn_backend_cls`` whenever the hardware capability and both
+APIs are present; hosts without them keep the FIA backend.
+
+Scope: shared-KV GQA/MQA full attention (e.g. the full-attention layers of
+Qwen3.5) with the standard paged KV cache. Query runs in the varlen TND
+layout against the PA_BBND paged cache layout
+``(num_blocks, block_size, num_kv_heads, head_size)`` -- exactly the layout
+``AscendAttentionBackend`` allocates, so ``reshape_and_cache`` and the KV
+cache shape are inherited unchanged. MLA, sparse attention, sliding window,
+alibi and quantized KV caches are out of scope; the constructor rejects
+them instead of silently falling back.
+"""
+
+from importlib import import_module
+from importlib.util import find_spec
+
+import torch
+
+from vllm_ascend.attention.attention_v1 import (
+    AscendAttentionBackend,
+    AscendAttentionBackendImpl,
+    AscendAttentionMetadataBuilder,
+    AscendMetadata,
+)
+from vllm_ascend.attention.utils import enable_dcp, enable_pcp
+
+# Mask modes from the operator doc: 0 computes the full score matrix
+# (correct for single-row queries, where the KV range is bounded by
+# seqused_kv); 3 applies the causal mask.
+FLASH_ATTN_MASK_MODE_NO_MASK = 0
+FLASH_ATTN_MASK_MODE_CAUSAL = 3
+
+FLASH_ATTN_LAYOUT_TND = "TND"
+FLASH_ATTN_LAYOUT_PA_BBND = "PA_BBND"
+
+# The operator doc restricts D to 64/72/128/256 for the shared-KV
+# non-quantized interface (QK and V head dims must match here).
+FLASH_ATTN_SUPPORTED_HEAD_DIMS = (64, 72, 128, 256)
+
+# cache.get() sentinel for "not derived yet" -- distinct from None, which is
+# itself a valid attn_mask value on the NO_MASK path.
+_MASK_NOT_COMPUTED = object()
+
+
+def get_flash_attn_ops() -> tuple | None:
+    """Find the two flash_attn APIs in the active CANN operator package.
+
+    Mirrors ``attention.utils.get_flashmla_ops``: an absent package or API
+    permits falling back to the FIA backend before KV cache allocation,
+    while import failures inside an installed package remain errors.
+    """
+    if find_spec("cann_ops_transformer") is None:
+        return None
+    ops = import_module("cann_ops_transformer.ops")
+    attention_op = getattr(ops, "flash_attn", None)
+    metadata_op = getattr(ops, "flash_attn_metadata", None)
+    if callable(attention_op) and callable(metadata_op):
+        return attention_op, metadata_op
+    return None
+
+
+class AscendFlashAttnBackend(AscendAttentionBackend):
+    """Backend for the non-quantized CANN flash_attn dual-operator interface."""
+
+    @staticmethod
+    def get_impl_cls() -> type["AscendFlashAttnImpl"]:
+        if enable_pcp() or enable_dcp():
+            raise NotImplementedError("flash_attn backend does not support PCP/DCP yet.")
+        return AscendFlashAttnImpl
+
+    @staticmethod
+    def get_builder_cls() -> type["AscendAttentionMetadataBuilder"]:
+        return AscendAttentionMetadataBuilder
+
+
+class AscendFlashAttnImpl(AscendAttentionBackendImpl):
+    """Full-attention impl driving flash_attn_metadata + flash_attn.
+
+    One flash_attn call per step for the whole batch (decode and prefill
+    alike); a step whose every query is one row long drops the mask
+    (NO_MASK), which is equivalent there and picks a cheaper kernel. This
+    mirrors the QFA design in attention_c8_mxfp.py.
+
+    Graph capture: cu_seqlens_q / seqused_kv are derived on device from the
+    runner's persistent buffers (query_start_loc_gpu / seq_lens_gpu), so
+    every replay re-executes the derivation and sees the current step's
+    lengths. The per-step metadata plan is shared by every full-attention
+    layer: its inputs (head counts, lengths, mask mode, layouts) are not
+    layer-specific, and the main operator treats ``metadata`` as read-only.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.sliding_window is not None:
+            raise ValueError(
+                "AscendFlashAttnImpl does not support sliding window attention. "
+                "Please disable sliding window or use the default FIA backend."
+            )
+        if self.alibi_slopes is not None:
+            raise ValueError(
+                "AscendFlashAttnImpl does not support ALiBi. Please use the default FIA backend."
+            )
+        if self.head_size not in FLASH_ATTN_SUPPORTED_HEAD_DIMS:
+            raise ValueError(
+                f"AscendFlashAttnImpl requires head_size in {FLASH_ATTN_SUPPORTED_HEAD_DIMS}, "
+                f"got {self.head_size}."
+            )
+        if self.use_bnsd_kv_cache:
+            raise ValueError(
+                "AscendFlashAttnImpl requires the default PA_BBND paged KV cache layout. "
+                "Please unset VLLM_KV_CACHE_LAYOUT (LBHNC/HND) or use the default FIA backend."
+            )
+        ops = get_flash_attn_ops()
+        if ops is None:
+            raise ValueError(
+                "AscendFlashAttnImpl requires cann_ops_transformer with the "
+                "flash_attn and flash_attn_metadata APIs (Ascend 950PR/950DT "
+                "build). Install a compatible cann_ops_transformer, or keep the "
+                "FIA backend by removing the package."
+            )
+        # Cache the resolved operators once. forward_impl and the metadata
+        # derivation run inside the captured region, so re-resolving via
+        # find_spec/import_module on every replay is both wasteful and can
+        # re-trigger import side effects each step.
+        self._flash_attn_op, self._flash_attn_metadata_op = ops
+
+    def _flash_attn_step_cache(self, attn_metadata: AscendMetadata) -> dict:
+        """The step-wide scratch shared by every full-attention layer.
+
+        ``AscendMetadata`` declares ``flash_attn_metadata_cache`` as a field,
+        and the builder builds one metadata per step shared by all layers, so
+        any per-step derivation stored here is computed once and consumed by
+        every layer. The getattr fallback keeps hand-built metadata objects
+        (e.g. unit-test namespaces) working without the schema field.
+        """
+        cache = getattr(attn_metadata, "flash_attn_metadata_cache", None)
+        if cache is None:
+            cache = {}
+            attn_metadata.flash_attn_metadata_cache = cache
+        return cache
+
+    def _flash_attn_step_lengths(
+        self, attn_metadata: AscendMetadata, num_tokens: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return this step's (cu_seqlens_q, seqused_kv), derived once.
+
+        Derived in-graph by the first full-attention layer; every other layer
+        consumes the recorded tensors, and each replay re-executes that one
+        derivation against the refreshed buffers.
+        """
+        cache = self._flash_attn_step_cache(attn_metadata)
+        lengths = cache.get("lengths")
+        if lengths is None:
+            # The persistent buffers are sized for max_num_reqs (+ a padding
+            # slot for query_start_loc) and carry stale tail entries from
+            # larger earlier steps. Slice to the exact request count first so
+            # cu_seqlens_q has length num_reqs + 1 and seqused_kv length
+            # num_reqs, keeping them aligned with block_tables' num_reqs rows
+            # (the flash_attn op does not validate this alignment, see doc).
+            num_reqs = attn_metadata.num_reqs
+            # Clamp sanitizes the tail within the valid prefix: unused
+            # query_start_loc slots carry -1 (FIA padding convention) and may
+            # hold stale entries from larger earlier steps; cummax restores
+            # monotonicity, turning the tail into zero-length requests.
+            # seq_lens clamp(min=1) matches the dummy-request convention
+            # (block 0, one token).
+            lengths = (
+                attn_metadata.query_start_loc_gpu[: num_reqs + 1]
+                .clamp(min=0, max=num_tokens)
+                .cummax(dim=0)
+                .values,
+                attn_metadata.seq_lens_gpu[:num_reqs].clamp(min=1),
+            )
+            cache["lengths"] = lengths
+        return lengths
+
+    def _flash_attn_step_scalars(self, attn_metadata: AscendMetadata) -> tuple[int, int]:
+        """Return (max_seqlen_q, mask_mode), derived once per step.
+
+        max_query_len is None for decode steps (every request contributes one
+        row), so fall back to 1 there: inflating it to the batch token total
+        would mislabel the step as prefill for the metadata plan and force the
+        expensive CAUSAL kernel. Drop the mask entirely at Q_S == 1, where
+        NO_MASK is equivalent (seqused_kv bounds each KV range); MTP verify
+        steps (Q_S = 1 + num_spec) keep CAUSAL.
+        """
+        cache = self._flash_attn_step_cache(attn_metadata)
+        scalars = cache.get("scalars")
+        if scalars is None:
+            max_seqlen_q = attn_metadata.max_query_len if attn_metadata.max_query_len is not None else 1
+            mask_mode = (
+                FLASH_ATTN_MASK_MODE_NO_MASK if max_seqlen_q == 1 else FLASH_ATTN_MASK_MODE_CAUSAL
+            )
+            scalars = cache["scalars"] = (max_seqlen_q, mask_mode)
+        return scalars
+
+    def _flash_attn_int8_mask(self, attn_metadata: AscendMetadata) -> torch.Tensor | None:
+        """flash_attn's attn_mask is INT8, derived once per step.
+
+        The shared builder already hands out an int8 causal mask, so the
+        common case is just an identity; but a non-int8 source is converted
+        once here and the result cached so every layer consumes the same
+        tensor. Stored under a sentinel that is distinct from any plan key.
+        """
+        cache = self._flash_attn_step_cache(attn_metadata)
+        mask = cache.get("attn_mask", _MASK_NOT_COMPUTED)
+        if mask is _MASK_NOT_COMPUTED:
+            mask = cache["attn_mask"] = self._convert_int8_mask(attn_metadata.attn_mask)
+        return mask
+
+    @staticmethod
+    def _convert_int8_mask(mask: torch.Tensor | None) -> torch.Tensor | None:
+        if mask is None:
+            return None
+        return mask if mask.dtype == torch.int8 else mask.to(torch.int8)
+
+    def _flash_attn_block_table(self, attn_metadata: AscendMetadata) -> torch.Tensor:
+        """Return this step's block table sliced to num_reqs, derived once.
+
+        block_tables is a persistent max_num_reqs-row buffer; slicing to the
+        exact request count keeps its row count B aligned with cu_seqlens_q's
+        length B + 1 (the op treats block_table's row count as B and does not
+        validate the alignment, so a stale tail would feed bogus block ids).
+        The slice is a view, so sharing it by identity across layers is safe.
+        """
+        cache = self._flash_attn_step_cache(attn_metadata)
+        block_table = cache.get("block_table")
+        if block_table is None:
+            block_table = cache["block_table"] = attn_metadata.block_tables[: attn_metadata.num_reqs]
+        return block_table
+
+    def _get_flash_attn_metadata(
+        self,
+        attn_metadata: AscendMetadata,
+        *,
+        cu_seqlens_q: torch.Tensor,
+        seqused_kv: torch.Tensor,
+        max_seqlen_q: int,
+        mask_mode: int,
+    ):
+        """Return the flash_attn metadata plan, derived once a step.
+
+        The plan's inputs are all non-layer-specific (head counts, lengths,
+        mask mode, layouts), so one plan serves every full-attention layer of
+        a step. Sharing is safe under graph capture for the same reason as
+        _flash_attn_step_lengths: the deriving call runs inside the captured
+        region, ahead of every flash_attn call that reads its output, and the
+        main operator treats ``metadata`` as a read-only input.
+        """
+        cache = self._flash_attn_step_cache(attn_metadata)
+        plan_key = (
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_size,
+            max_seqlen_q,
+            mask_mode,
+        )
+        metadata = cache.get(plan_key)
+        if metadata is None:
+            # TND + PA: pass cu_seqlens_q only; the KV side is addressed via
+            # block_table + seqused_kv. batch_size must NOT be passed with a
+            # TND layout_q.
+            metadata = self._flash_attn_metadata_op(
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_size,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_kv=None,
+                seqused_q=None,
+                seqused_kv=seqused_kv,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_kv=-1,
+                mask_mode=mask_mode,
+                win_left=-1,
+                win_right=-1,
+                layout_q=FLASH_ATTN_LAYOUT_TND,
+                layout_kv=FLASH_ATTN_LAYOUT_PA_BBND,
+                layout_out=FLASH_ATTN_LAYOUT_TND,
+            )
+            cache[plan_key] = metadata
+        return metadata
+
+    def forward_impl(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: tuple[torch.Tensor],
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """One flash_attn call per step for the whole batch.
+
+        reshape_and_cache (run by forward() ahead of this hook) has already
+        written this step's K/V into the paged cache, so PrefillNoCache steps
+        are included: the operator reads the cache through block_table and
+        never sees the current-step K/V tensors directly.
+        """
+        if not attn_metadata.causal:
+            raise NotImplementedError("flash_attn backend does not support non-causal attention yet.")
+
+        num_tokens = attn_metadata.num_actual_tokens
+        if num_tokens <= 0:
+            return output
+        # T as the operator sees it: the query rows actually fed in. At graph
+        # capture this is the bucket size; eagerly it is the real token
+        # count. The TND constraint cu_seqlens_q[-1] == T, the view/output
+        # row counts and the sanitize clamp below all share this source.
+        query = query[:num_tokens]
+
+        qsl_gpu = attn_metadata.query_start_loc_gpu
+        seq_lens_gpu = attn_metadata.seq_lens_gpu
+        if qsl_gpu is None or seq_lens_gpu is None:
+            raise RuntimeError(
+                "flash_attn backend requires the GPU-side length sources "
+                "(query_start_loc_gpu / seq_lens_gpu) on AscendMetadata."
+            )
+        cu_seqlens_q, seqused_kv = self._flash_attn_step_lengths(attn_metadata, num_tokens)
+        max_seqlen_q, mask_mode = self._flash_attn_step_scalars(attn_metadata)
+
+        fa_metadata = self._get_flash_attn_metadata(
+            attn_metadata,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_kv=seqused_kv,
+            max_seqlen_q=max_seqlen_q,
+            mask_mode=mask_mode,
+        )
+
+        attention_op = self._flash_attn_op
+        block_table = self._flash_attn_block_table(attn_metadata)
+        # The doc forbids attn_mask under NO_MASK and requires the fixed
+        # 2048x2048 lower-triangular int8 mask under CAUSAL, so the two
+        # travel together.
+        result = attention_op(
+            query,
+            self.key_cache,
+            self.value_cache,
+            block_table=block_table,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=None,
+            seqused_q=None,
+            seqused_kv=seqused_kv,
+            sinks=self.sinks,
+            metadata=fa_metadata,
+            softmax_scale=self.scale,
+            mask_mode=mask_mode,
+            attn_mask=(
+                None if mask_mode == FLASH_ATTN_MASK_MODE_NO_MASK else self._flash_attn_int8_mask(attn_metadata)
+            ),
+            win_left=-1,
+            win_right=-1,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=-1,
+            layout_q=FLASH_ATTN_LAYOUT_TND,
+            layout_kv=FLASH_ATTN_LAYOUT_PA_BBND,
+            layout_out=FLASH_ATTN_LAYOUT_TND,
+            return_softmax_lse=False,
+        )
+        # return_softmax_lse=False yields an empty LSE tensor in the
+        # cann_ops flavor; tolerate both tuple and single-tensor returns.
+        attn_output = result[0] if isinstance(result, tuple) else result
+        attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
+        output[:num_tokens] = attn_output
+        return output
