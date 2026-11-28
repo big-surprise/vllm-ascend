@@ -347,119 +347,159 @@ class TestFlashAttnBackendValidation(TestBase):
             self.assertTrue(self._validate())
 
 
-class TestFlashAttnArgsDump(TestBase):
-    """VLLM_ASCEND_FLASH_ATTN_DEBUG dumps the operator operands once a step.
+class TestFlashAttnGeometry(TestBase):
+    """The mask geometry rule lives in one place, shared by the plan-side
+    record and the operator call."""
 
-    The first full-attention layer of a step emits the record and marks the
-    metadata; the remaining layers skip it, so a 48-layer model pays one
-    device sync a step at most. Values are materialized only when the step
-    runs eagerly -- a capture logs shapes instead.
+    def test_one_row_queries_drop_the_mask(self):
+        self.assertEqual(flash_attn_v1.resolve_flash_attn_geometry(1), (1, 0))
+
+    def test_decode_falls_back_to_one_row(self):
+        # max_query_len is None on decode; using the batch token total here
+        # would mislabel the step as prefill and force CAUSAL forever.
+        self.assertEqual(flash_attn_v1.resolve_flash_attn_geometry(None), (1, 0))
+
+    def test_multi_row_queries_keep_the_causal_mask(self):
+        self.assertEqual(flash_attn_v1.resolve_flash_attn_geometry(1024), (1024, 3))
+
+
+class TestFlashAttnArgDump(TestBase):
+    """VLLM_ASCEND_FLASH_ATTN_DEBUG records the flash_attn operands.
+
+    The record is emitted from AscendFlashAttnMetadataBuilder.build(): one
+    host-side call per scheduled step, including steps whose forward is an
+    ACL-graph replay. That coverage is the point -- a dump inside
+    forward_impl only ever sees eagerly executed prefill, because decode
+    replays never re-enter the Python there.
     """
 
-    NUM_HEADS = 8
-    NUM_KV_HEADS = 2
-    HEAD_SIZE = 128
-    NUM_TOKENS = 5
-
     def setUp(self):
-        self.impl = object.__new__(AscendFlashAttnImpl)
-        self.impl.num_heads = self.NUM_HEADS
-        self.impl.num_kv_heads = self.NUM_KV_HEADS
-        self.impl.head_size = self.HEAD_SIZE
-        self.impl.scale = 1.0 / (self.HEAD_SIZE**0.5)
-        self.impl.sinks = None
-        self.impl.key_cache = torch.zeros(4, 128, self.NUM_KV_HEADS, self.HEAD_SIZE)
-        self.impl.value_cache = torch.zeros(4, 128, self.NUM_KV_HEADS, self.HEAD_SIZE)
-        self.impl._flash_attn_op = MagicMock(
-            return_value=(torch.zeros(self.NUM_TOKENS, self.NUM_HEADS, self.HEAD_SIZE), torch.empty(1))
-        )
-        self.impl._flash_attn_metadata_op = MagicMock(return_value=MagicMock())
+        self._reset()
+        flash_attn_v1._flash_attn_debug_limit = 3  # enabled, 3 distinct shapes
 
     def tearDown(self):
-        # The record counter and the memoized limit are module-level state.
-        flash_attn_v1._flash_attn_debug_records = 0
+        self._reset()
         flash_attn_v1._flash_attn_debug_limit = None
 
-    def _metadata(self, *, max_query_len=1, attn_mask=None):
+    @staticmethod
+    def _reset():
+        flash_attn_v1._flash_attn_debug_records = 0
+        flash_attn_v1._flash_attn_debug_shapes.clear()
+
+    def _metadata(self, *, num_reqs=2, num_tokens=5, seq_lens=(10, 20), block_rows=2):
         return SimpleNamespace(
-            causal=True,
-            num_actual_tokens=self.NUM_TOKENS,
-            num_reqs=2,
-            query_start_loc_gpu=torch.tensor([0, 3, 5], dtype=torch.int32),
-            seq_lens_gpu=torch.tensor([10, 20], dtype=torch.int32),
-            max_query_len=max_query_len,
-            block_tables=torch.zeros(2, 2, dtype=torch.int32),
-            attn_mask=attn_mask,
+            num_reqs=num_reqs,
+            num_actual_tokens=num_tokens,
+            attn_state="ChunkedPrefill",
+            seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
+            block_tables=torch.zeros(block_rows, 4, dtype=torch.int32),
         )
 
-    def _run(self, attn_metadata, layers=1):
-        """Drive `layers` decode layers over one step's metadata."""
-        query = torch.zeros(self.NUM_TOKENS, self.NUM_HEADS, self.HEAD_SIZE)
-        output = torch.zeros_like(query)
+    def _common(self, *, max_query_len=1024, query_start_loc=(0, 3, 5)):
+        return SimpleNamespace(
+            max_query_len=max_query_len,
+            query_start_loc_cpu=torch.tensor(query_start_loc, dtype=torch.int32),
+        )
+
+    def _dump(self, metadata, common):
         with patch.object(flash_attn_v1, "logger") as mock_logger:
-            for _ in range(layers):
-                self.impl.forward_impl(query, None, None, None, attn_metadata, output)
+            flash_attn_v1.dump_flash_attn_plan(metadata, common)
         return mock_logger
 
     @staticmethod
     def _record(mock_logger):
-        """The single emitted record, flattened to text for assertions."""
         assert mock_logger.info.call_count == 1, mock_logger.info.call_args_list
         return " ".join(str(arg) for arg in mock_logger.info.call_args[0])
 
     def test_disabled_by_default(self):
-        mock_logger = self._run(self._metadata())
+        flash_attn_v1._flash_attn_debug_limit = 0
+        mock_logger = self._dump(self._metadata(), self._common())
         mock_logger.info.assert_not_called()
 
-    def test_one_record_a_step_shared_by_every_layer(self):
-        flash_attn_v1._flash_attn_debug_limit = 3  # enabled, 3 steps
-        record = self._record(self._run(self._metadata(), layers=48))
+    def test_prefill_record_carries_every_operand(self):
+        record = self._record(self._dump(self._metadata(), self._common()))
         self.assertIn("[FLASH_ATTN_DEBUG]", record)
-        self.assertIn("mode=eager", record)
         self.assertIn("T=5", record)
         self.assertIn("B=2", record)
-        self.assertIn("max_seqlen_q=1", record)
+        self.assertIn("max_seqlen_q=1024", record)
         self.assertIn("max_seqlen_kv=-1", record)
-        self.assertIn("mask_mode=0", record)
-        # The two length tensors carry their values, the unset ones read None.
-        self.assertIn("values=[0, 3, 5]", record)
-        self.assertIn("values=[10, 20]", record)
+        self.assertIn("mask_mode=3", record)
+        self.assertIn("cu_seqlens_q=shape=(3,) dtype=torch.int32 values=[0, 3, 5]", record)
+        self.assertIn("seqused_kv=shape=(2,) dtype=torch.int32 values=[10, 20]", record)
         self.assertIn("cu_seqlens_kv=None", record)
         self.assertIn("seqused_q=None", record)
+        self.assertIn("block_table=shape=(2, 4)", record)
 
-    def test_prefill_step_reports_the_causal_geometry(self):
-        flash_attn_v1._flash_attn_debug_limit = 3
-        mask = torch.triu(torch.ones(2048, 2048), diagonal=1).to(torch.int8)
-        record = self._record(self._run(self._metadata(max_query_len=3, attn_mask=mask)))
-        self.assertIn("max_seqlen_q=3", record)
-        self.assertIn("mask_mode=3", record)
+    def test_decode_record_drops_the_mask(self):
+        metadata = self._metadata(num_reqs=2, num_tokens=2, seq_lens=(11, 21))
+        common = self._common(max_query_len=None, query_start_loc=(0, 1, 2))
+        record = self._record(self._dump(metadata, common))
+        self.assertIn("max_seqlen_q=1", record)
+        self.assertIn("mask_mode=0", record)
+        self.assertIn("values=[0, 1, 2]", record)
 
-    def test_capture_logs_shapes_only(self):
-        # A device sync is illegal inside a graph capture, so values are
-        # skipped there rather than faulting the capture.
-        flash_attn_v1._flash_attn_debug_limit = 3
-        with patch.object(flash_attn_v1, "_EXTRA_CTX", SimpleNamespace(capturing=True)):
-            record = self._record(self._run(self._metadata()))
-        self.assertIn("mode=capture", record)
-        self.assertIn("values=skipped(capture)", record)
-        self.assertIn("shape=(3,)", record)
-        self.assertNotIn("[0, 3, 5]", record)
-
-    def test_cap_stops_the_dump(self):
-        # Each step brings fresh metadata, so only the cap limits the records.
-        flash_attn_v1._flash_attn_debug_limit = 1
-        query = torch.zeros(self.NUM_TOKENS, self.NUM_HEADS, self.HEAD_SIZE)
-        output = torch.zeros_like(query)
+    def test_prefill_and_decode_both_get_a_record(self):
+        # The regression this covers: with a record budget shared across both
+        # phases, one prefill line used to swallow the whole quota and decode
+        # (the shape users actually come here to check) never appeared.
         with patch.object(flash_attn_v1, "logger") as mock_logger:
-            for _ in range(3):
-                self.impl.forward_impl(query, None, None, None, self._metadata(), output)
+            flash_attn_v1.dump_flash_attn_plan(self._metadata(), self._common())
+            flash_attn_v1.dump_flash_attn_plan(
+                self._metadata(num_tokens=2, seq_lens=(11, 21)),
+                self._common(max_query_len=None, query_start_loc=(0, 1, 2)),
+            )
+        self.assertEqual(mock_logger.info.call_count, 2)
+        texts = [" ".join(str(arg) for arg in call[0]) for call in mock_logger.info.call_args_list]
+        self.assertIn("mask_mode=3", texts[0])
+        self.assertIn("mask_mode=0", texts[1])
+
+    def test_identical_steps_collapse(self):
+        with patch.object(flash_attn_v1, "logger") as mock_logger:
+            for _ in range(8):
+                flash_attn_v1.dump_flash_attn_plan(self._metadata(), self._common())
         self.assertEqual(mock_logger.info.call_count, 1)
 
-    def test_negative_cap_never_stops(self):
+    def test_seq_lens_is_sliced_to_num_reqs(self):
+        # seq_lens carries the FIA dummy-request padding (one extra entry);
+        # only the num_reqs prefix reaches the operator.
+        metadata = self._metadata(num_reqs=2, seq_lens=(10, 20, 1))
+        record = self._record(self._dump(metadata, self._common()))
+        self.assertIn("values=[10, 20]", record)
+
+    def test_padded_block_table_keeps_its_buffer_shape(self):
+        # block_tables is a max_num_reqs-row buffer; the record reports the
+        # buffer while B=num_reqs states the rows the operator actually sees.
+        metadata = self._metadata(num_reqs=2, block_rows=4)
+        record = self._record(self._dump(metadata, self._common()))
+        self.assertIn("B=2", record)
+        self.assertIn("block_table=shape=(4, 4)", record)
+
+    def test_cap_counts_distinct_shapes(self):
+        flash_attn_v1._flash_attn_debug_limit = 1
+        with patch.object(flash_attn_v1, "logger") as mock_logger:
+            flash_attn_v1.dump_flash_attn_plan(self._metadata(), self._common())
+            flash_attn_v1.dump_flash_attn_plan(
+                self._metadata(num_tokens=2, seq_lens=(11, 21)),
+                self._common(max_query_len=None, query_start_loc=(0, 1, 2)),
+            )
+        self.assertEqual(mock_logger.info.call_count, 1)
+
+    def test_negative_cap_traces_every_step(self):
         flash_attn_v1._flash_attn_debug_limit = -1
-        query = torch.zeros(self.NUM_TOKENS, self.NUM_HEADS, self.HEAD_SIZE)
-        output = torch.zeros_like(query)
         with patch.object(flash_attn_v1, "logger") as mock_logger:
             for _ in range(3):
-                self.impl.forward_impl(query, None, None, None, self._metadata(), output)
+                flash_attn_v1.dump_flash_attn_plan(self._metadata(), self._common())
         self.assertEqual(mock_logger.info.call_count, 3)
+
+    def test_missing_host_buffers_are_tolerated(self):
+        # Build paths without the CPU length buffers must not crash the step.
+        record = self._record(self._dump(self._metadata(), SimpleNamespace(max_query_len=1)))
+        self.assertIn("cu_seqlens_q=None", record)
+
+
+class TestFlashAttnBuilderWiring(TestBase):
+    def test_backend_returns_the_recording_builder(self):
+        builder_cls = AscendFlashAttnBackend.get_builder_cls()
+        self.assertIs(builder_cls, flash_attn_v1.AscendFlashAttnMetadataBuilder)
+        # Still the generic builder's behaviour, only with the record added.
+        self.assertTrue(issubclass(builder_cls, flash_attn_v1.AscendAttentionMetadataBuilder))
